@@ -1,0 +1,846 @@
+/* Parlons — TCF French trainer (A1 → B2). No build step, no backend. */
+(() => {
+"use strict";
+const LEVELS = ["A1","A2","B1","B2"];
+const LKEY = "parlons-v1";
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const today = () => { const d=new Date(); return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); };
+const DAY = 864e5;
+const shuffle = a => { a=[...a]; for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; };
+const lvlIdx = l => LEVELS.indexOf(l);
+const upTo = l => LEVELS.slice(0, lvlIdx(l)+1);
+
+/* ---------------- State ---------------- */
+const DEFAULT = {v:1,onboarded:false,level:"A1",examDate:"",xp:0,streak:0,best:0,lastDay:"",days:{},
+  srs:{},grammar:{},oral:{},ecrit:{},dictee:{n:0,sum:0},pron:{n:0,sum:0},writing:[],speaking:[],exams:[],
+  daily:{date:"",steps:{}},
+  settings:{voice:"",rate:0.95,recLang:"fr-FR",apiKey:"",model:"claude-sonnet-5-5",fbLang:"en",newPerDay:8}};
+let S;
+try { S = Object.assign(structuredClone(DEFAULT), JSON.parse(localStorage.getItem(LKEY)||"{}")); S.settings = Object.assign(structuredClone(DEFAULT.settings), S.settings||{}); }
+catch(e){ S = structuredClone(DEFAULT); }
+const save = () => { try { localStorage.setItem(LKEY, JSON.stringify(S)); } catch(e){} };
+
+function addXP(n){
+  const d = today();
+  S.xp += n; S.days[d] = (S.days[d]||0) + n;
+  if (S.lastDay !== d){
+    const y = new Date(Date.now()-DAY); const yd = y.getFullYear()+"-"+String(y.getMonth()+1).padStart(2,"0")+"-"+String(y.getDate()).padStart(2,"0");
+    S.streak = (S.lastDay === yd) ? S.streak+1 : 1; S.lastDay = d; S.best = Math.max(S.best, S.streak);
+  }
+  save();
+}
+function markDaily(step){
+  if (S.daily.date !== today()) S.daily = {date:today(), steps:{}};
+  if (!S.daily.steps[step]){ S.daily.steps[step] = true; save();
+    if (Object.keys(S.daily.steps).length === 4) { addXP(20); toast("Séance du jour terminée ! +20 XP 🎉"); } }
+}
+const dailySteps = () => S.daily.date === today() ? S.daily.steps : {};
+
+function toast(msg, ms=2400){ const t=document.createElement("div"); t.className="toast"; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(), ms); }
+
+/* ---------------- Text-to-speech ---------------- */
+const TTS = {
+  voices:[], speaking:false,
+  load(){ const v = speechSynthesis.getVoices().filter(v=>/^fr/i.test(v.lang)); if (v.length) this.voices = v; return this.voices; },
+  voice(i=0){ const vs=this.load(); if(!vs.length) return null;
+    const pref = vs.find(v=>v.name===S.settings.voice) || vs.find(v=>/fr-FR/i.test(v.lang)&&/(Amélie|Audrey|Thomas|Google|Denise|Marie)/i.test(v.name)) || vs.find(v=>/fr-FR/i.test(v.lang)) || vs[0];
+    if (i===0) return pref;
+    const other = vs.find(v=>v!==pref && v.lang===pref.lang) || vs.find(v=>v!==pref);
+    return other || pref; },
+  stop(){ speechSynthesis.cancel(); this.speaking=false; $$(".speak.playing").forEach(b=>b.classList.remove("playing")); },
+  speak(text, opts={}){
+    if (!("speechSynthesis" in window)) { toast("La synthèse vocale n'est pas disponible sur cet appareil."); return; }
+    this.stop();
+    const rate = (opts.rate ?? S.settings.rate);
+    const lines = String(text).split("\n").filter(Boolean);
+    const queue = [];
+    for (const raw of lines){
+      let who = 0, line = raw;
+      const m = raw.match(/^([AB]):\s*(.*)$/); if (m){ who = m[1]==="A"?0:1; line = m[2]; }
+      for (const part of line.split(/(?<=[.!?…;])\s+/)) if (part.trim()) queue.push({who, part:part.replace(/…/g,"...")});
+    }
+    if (!queue.length) return;
+    this.speaking = true; opts.btn && opts.btn.classList.add("playing");
+    let i = 0;
+    const next = () => {
+      if (!this.speaking) return;
+      if (i >= queue.length){ this.speaking=false; opts.btn && opts.btn.classList.remove("playing"); opts.onend && opts.onend(); return; }
+      const {who, part} = queue[i++];
+      const u = new SpeechSynthesisUtterance(part);
+      const v = this.voice(who); if (v){ u.voice = v; u.lang = v.lang; } else u.lang = "fr-FR";
+      u.rate = rate; u.pitch = (who===1 && this.voice(1)===this.voice(0)) ? 0.8 : 1;
+      u.onend = () => setTimeout(next, who!==(queue[i]?.who ?? who) ? 350 : 120);
+      u.onerror = () => { this.speaking=false; opts.btn && opts.btn.classList.remove("playing"); };
+      speechSynthesis.speak(u);
+    };
+    next();
+  }
+};
+if ("speechSynthesis" in window){ TTS.load(); speechSynthesis.onvoiceschanged = () => TTS.load(); }
+const speakBtn = (text, extra="") => `<button class="speak" data-say="${esc(text)}" ${extra} aria-label="Écouter">🔊</button>`;
+
+/* ---------------- Speech recognition ---------------- */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+function makeRecognizer({continuous=true, onText, onEnd}){
+  if (!SR) return null;
+  let rec, active=false, finalText="", restarts=0, lastStart=0;
+  const start = () => {
+    rec = new SR(); rec.lang = S.settings.recLang; rec.continuous = continuous; rec.interimResults = true; rec.maxAlternatives = 1;
+    rec.onresult = e => {
+      let interim = "";
+      for (let i=e.resultIndex;i<e.results.length;i++){ const r=e.results[i]; if (r.isFinal) finalText += (finalText?" ":"") + r[0].transcript.trim(); else interim += r[0].transcript; }
+      onText && onText(finalText, interim);
+    };
+    rec.onerror = e => { if (e.error==="not-allowed"||e.error==="service-not-allowed"){ active=false; toast("Micro refusé. Autorisez le micro dans les réglages du navigateur."); } };
+    rec.onend = () => {
+      if (active && continuous && restarts < 40){ const wait = Math.max(0, 500-(Date.now()-lastStart)); restarts++; setTimeout(()=>{ if(active){ lastStart=Date.now(); try{rec.start();}catch(e){} } }, wait); }
+      else { active=false; onEnd && onEnd(finalText); }
+    };
+    lastStart = Date.now(); rec.start();
+  };
+  return {
+    start(){ finalText=""; restarts=0; active=true; try{ start(); }catch(e){ active=false; toast("Impossible de démarrer le micro."); } },
+    stop(){ active=false; try{ rec && rec.stop(); }catch(e){} },
+    get text(){ return finalText; }, get active(){ return active; }
+  };
+}
+
+/* ---------------- Text comparison ---------------- */
+const NUM = {0:"zéro",1:"un",2:"deux",3:"trois",4:"quatre",5:"cinq",6:"six",7:"sept",8:"huit",9:"neuf",10:"dix",11:"onze",12:"douze",13:"treize",14:"quatorze",15:"quinze",16:"seize",17:"dix-sept",18:"dix-huit",19:"dix-neuf",20:"vingt",30:"trente",40:"quarante",50:"cinquante",60:"soixante",100:"cent",1000:"mille"};
+const strip = s => s.normalize("NFD").replace(/[̀-ͯ]/g,"");
+function words(s){
+  return String(s).toLowerCase().replace(/[’`]/g,"'").replace(/(\d+)\s*h\b/g,"$1 heures")
+    .replace(/\b\d+\b/g, n => NUM[n] || n).replace(/'/g,"' ").replace(/[^\p{L}\p{N}'\- ]/gu," ")
+    .split(/\s+/).filter(Boolean).flatMap(w => w.split(/-(?=\p{L})/u)).filter(Boolean);
+}
+function align(target, hyp, eq){
+  const n=target.length, m=hyp.length, D=Array.from({length:n+1},()=>new Array(m+1).fill(0));
+  for(let i=0;i<=n;i++) D[i][0]=i; for(let j=0;j<=m;j++) D[0][j]=j;
+  for(let i=1;i<=n;i++) for(let j=1;j<=m;j++) D[i][j]=Math.min(D[i-1][j]+1,D[i][j-1]+1,D[i-1][j-1]+(eq(target[i-1],hyp[j-1])?0:1));
+  const out=[]; let i=n,j=m;
+  while(i>0||j>0){
+    if(i>0&&j>0&&D[i][j]===D[i-1][j-1]+(eq(target[i-1],hyp[j-1])?0:1)){ out.unshift({t:target[i-1],h:hyp[j-1]}); i--; j--; }
+    else if(i>0&&D[i][j]===D[i-1][j]+1){ out.unshift({t:target[i-1],h:null}); i--; }
+    else { out.unshift({t:null,h:hyp[j-1]}); j--; }
+  }
+  return out;
+}
+function compare(targetStr, hypStr, {accents=true}={}){
+  const t = words(targetStr), h = words(hypStr);
+  const loose = (a,b) => strip(a)===strip(b);
+  const al = align(t, h, loose);
+  let ok=0, acc=0; const tokens=[];
+  for (const p of al){
+    if (p.t===null) continue;
+    if (p.h===null){ tokens.push({w:p.t,c:"w-miss"}); continue; }
+    if (p.t===p.h){ ok++; tokens.push({w:p.t,c:"w-ok"}); }
+    else if (loose(p.t,p.h)){ if(accents){ acc++; tokens.push({w:p.h,c:"w-acc",fix:p.t}); } else { ok++; tokens.push({w:p.t,c:"w-ok"}); } }
+    else tokens.push({w:p.h,c:"w-ko",fix:p.t});
+  }
+  const extra = al.filter(p=>p.t===null).length;
+  const score = t.length ? Math.max(0, (ok + acc*0.5 - extra*0.25) / t.length) : 0;
+  return {score:Math.round(score*100), tokens, ok, acc, total:t.length};
+}
+const renderTokens = toks => toks.map(t => `<span class="${t.c}" ${t.fix?`title="${esc(t.fix)}"`:""}>${esc(t.w)}</span>${t.fix&&t.c!=="w-ok"?`<sup class="small muted"> ${esc(t.fix)}</sup>`:""}`).join(" ");
+
+/* ---------------- Vocabulary SRS ---------------- */
+const INTERVALS = [0, 1, 2, 4, 8, 16, 35, 70];
+const wordId = w => w[0];
+function vocabPool(){ return VOCAB.filter(w => upTo(S.level).includes(w[2])); }
+function srsQueue(limit=12){
+  const now = Date.now(), due=[], fresh=[];
+  for (const w of vocabPool()){ const c = S.srs[wordId(w)]; if (!c) fresh.push(w); else if (c.due <= now) due.push(w); }
+  due.sort((a,b)=>S.srs[wordId(a)].due - S.srs[wordId(b)].due);
+  const introducedToday = Object.values(S.srs).filter(c=>c.intro===today()).length;
+  const newCount = Math.max(0, Math.min(S.settings.newPerDay - introducedToday, limit - due.length));
+  return [...due.slice(0,limit), ...fresh.slice(0,newCount)];
+}
+function grade(w, q){ // q: 0 again, 1 hard, 2 good
+  const id = wordId(w); const c = S.srs[id] || {box:0, due:0, intro:today(), seen:0};
+  c.seen++;
+  if (q===0){ c.box = 0; c.due = Date.now() + 10*60e3; }
+  else if (q===1){ c.box = Math.max(1, c.box); c.due = Date.now() + DAY; }
+  else { c.box = Math.min(INTERVALS.length-1, c.box+1); c.due = Date.now() + INTERVALS[c.box]*DAY; }
+  S.srs[id] = c; save();
+}
+const mastered = lvl => VOCAB.filter(w=>(!lvl||w[2]===lvl) && (S.srs[wordId(w)]?.box||0) >= 4).length;
+const learned = lvl => VOCAB.filter(w=>(!lvl||w[2]===lvl) && S.srs[wordId(w)]).length;
+
+/* ---------------- Progress ---------------- */
+function levelProgress(l){
+  const v = VOCAB.filter(w=>w[2]===l), g = GRAMMAR.filter(x=>x.level===l), o = ORAL.filter(x=>x.level===l), e = ECRIT.filter(x=>x.level===l);
+  const vs = v.reduce((a,w)=>a+Math.min(4,S.srs[wordId(w)]?.box||0)/4,0)/Math.max(1,v.length);
+  const gs = g.filter(x=>(S.grammar[x.id]?.best||0)>=0.8).length/Math.max(1,g.length);
+  const os = o.filter(x=>(S.oral[x.id]||0)>=0.5).length/Math.max(1,o.length);
+  const es = e.filter(x=>(S.ecrit[x.id]||0)>=0.5).length/Math.max(1,e.length);
+  return Math.round((vs*0.35+gs*0.3+os*0.175+es*0.175)*100);
+}
+
+/* ---------------- Router ---------------- */
+const app = $("#app");
+let cleanup = [];
+function onLeave(fn){ cleanup.push(fn); }
+function route(){
+  cleanup.forEach(f=>{try{f();}catch(e){}}); cleanup=[]; TTS.stop();
+  const [path, arg] = (location.hash.slice(2) || "home").split("/");
+  if (!S.onboarded && path !== "onboard" && path !== "placement") { location.hash = "#/onboard"; return; }
+  const view = VIEWS[path] || VIEWS.home;
+  app.innerHTML = ""; window.scrollTo(0,0);
+  view(arg ? decodeURIComponent(arg) : undefined);
+  $$(".nav a").forEach(a => a.classList.toggle("on", a.getAttribute("href") === "#/"+path || (path==="home"&&a.getAttribute("href")==="#/home")));
+  document.querySelector(".nav").style.display = (path==="onboard"||path==="placement") ? "none" : "";
+}
+window.addEventListener("hashchange", route);
+document.addEventListener("click", e => {
+  const s = e.target.closest("[data-say]");
+  if (s){ e.preventDefault(); if (s.classList.contains("playing")) TTS.stop(); else TTS.speak(s.dataset.say, {btn:s, rate: s.dataset.rate ? +s.dataset.rate : undefined}); }
+  const g = e.target.closest("[data-go]"); if (g){ if (location.hash === g.dataset.go) route(); else location.hash = g.dataset.go; }
+});
+const top = (title, back="#/home", right="") => `<div class="top"><button class="back" data-go="${back}" aria-label="Retour">‹</button><h2>${title}</h2>${right}</div>`;
+const html = (s) => { app.insertAdjacentHTML("beforeend", s); };
+
+/* ---------------- Accent keyboard ---------------- */
+function accentBar(target){
+  const chars = ["é","è","ê","à","â","ç","ô","î","ù","û","ë","ï","œ","«","»"];
+  const bar = document.createElement("div"); bar.className="accents";
+  bar.innerHTML = chars.map(c=>`<button type="button" data-ch="${c}">${c}</button>`).join("");
+  bar.addEventListener("click", e => { const b=e.target.closest("[data-ch]"); if(!b) return; e.preventDefault();
+    const el = target; const s=el.selectionStart??el.value.length, en=el.selectionEnd??el.value.length;
+    el.value = el.value.slice(0,s)+b.dataset.ch+el.value.slice(en); el.focus(); el.setSelectionRange(s+1,s+1); el.dispatchEvent(new Event("input")); });
+  return bar;
+}
+
+/* ---------------- AI grading ---------------- */
+function graderPrompt(kind, task, text){
+  const lang = S.settings.fbLang==="fr" ? "French" : "English (keep all corrections and example sentences in French)";
+  const what = kind==="write" ? `Expression écrite, tâche ${task.task} (${task.min}–${task.max} words)` : `Expression orale, tâche ${task.task} (transcribed by speech recognition, so ignore punctuation and minor transcription artifacts)`;
+  return `You are a certified TCF Canada examiner. Grade my answer for the ${what}.
+
+TASK: ${task.prompt}${task.docs?"\nDOCUMENTS:\n"+task.docs.join("\n"):""}
+
+MY ANSWER:
+"""
+${text}
+"""
+
+Respond in ${lang}. Format exactly:
+SCORE: <0-20>/20 · CECR: <A1–C2> · NCLC: <number>
+Then these sections with short bullets:
+## What worked
+## Errors to fix (quote → correction → why)
+## Upgrade to the next level (3 concrete techniques, vocabulary or structures)
+## Improved version (a corrected and enriched version of my answer, same length range)`;
+}
+function mdLite(s){
+  return esc(s).replace(/^## (.*)$/gm,"<h3 style='margin-top:14px'>$1</h3>").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")
+    .replace(/^[-•] (.*)$/gm,"<div style='padding-left:14px;text-indent:-10px'>• $1</div>").replace(/\n{2,}/g,"<br>");
+}
+async function gradeWithAPI(prompt){
+  const r = await fetch("https://api.anthropic.com/v1/messages", {method:"POST", headers:{"content-type":"application/json","x-api-key":S.settings.apiKey,
+    "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body: JSON.stringify({model:S.settings.model, max_tokens:2000, messages:[{role:"user",content:prompt}]})});
+  if (!r.ok){ const t = await r.text(); throw new Error(r.status+" "+t.slice(0,200)); }
+  const j = await r.json(); return j.content.map(c=>c.text||"").join("");
+}
+async function chatWithAPI(system, messages){
+  const r = await fetch("https://api.anthropic.com/v1/messages", {method:"POST", headers:{"content-type":"application/json","x-api-key":S.settings.apiKey,
+    "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body: JSON.stringify({model:S.settings.model, max_tokens:300, system, messages})});
+  if (!r.ok) throw new Error(r.status+"");
+  const j = await r.json(); return j.content.map(c=>c.text||"").join("");
+}
+function gradingPanel(container, kind, task, getText, onScore){
+  container.innerHTML = `
+    <div class="card stack">
+      <h3>Correction</h3>
+      ${S.settings.apiKey ? `<button class="btn" id="g-api">✨ Corriger maintenant</button>` : ""}
+      <button class="btn ${S.settings.apiKey?"ghost":""}" id="g-app">Corriger dans l'app Claude</button>
+      <p class="small muted">${S.settings.apiKey ? "Corrigé directement grâce à votre clé API." : "Ouvre Claude avec votre texte et la grille d'évaluation, gratuit avec votre abonnement. Le texte est aussi copié."}</p>
+      <div id="g-out"></div>
+      <div class="row"><input type="text" id="g-score" inputmode="numeric" placeholder="Note /20" style="max-width:120px"><button class="btn sm soft" id="g-save">Enregistrer la note</button></div>
+    </div>`;
+  const out = $("#g-out", container);
+  $("#g-app", container).onclick = async () => {
+    const text = getText(); if (!text.trim()) return toast("Écrivez ou dites quelque chose d'abord.");
+    const p = graderPrompt(kind, task, text);
+    window.open("https://claude.ai/new?q="+encodeURIComponent(p), "_blank");
+    try { await navigator.clipboard.writeText(p); } catch(e){}
+  };
+  const api = $("#g-api", container);
+  if (api) api.onclick = async () => {
+    const text = getText(); if (!text.trim()) return toast("Écrivez ou dites quelque chose d'abord.");
+    api.disabled = true; api.textContent = "Correction en cours…";
+    try {
+      const res = await gradeWithAPI(graderPrompt(kind, task, text));
+      out.innerHTML = `<div class="grade-box">${mdLite(res)}</div>`;
+      const m = res.match(/SCORE:\s*(\d{1,2})/i); if (m){ $("#g-score",container).value = m[1]; onScore(+m[1], res); }
+    } catch(e){ out.innerHTML = `<div class="feedback ko">Erreur : ${esc(e.message)}. Vérifiez votre clé dans Réglages.</div>`; }
+    api.disabled = false; api.textContent = "✨ Corriger à nouveau";
+  };
+  $("#g-save", container).onclick = () => { const v = parseInt($("#g-score",container).value,10); if (isNaN(v)||v<0||v>20) return toast("Note entre 0 et 20."); onScore(v); toast("Note enregistrée."); };
+}
+
+/* ================= VIEWS ================= */
+const VIEWS = {};
+
+/* ----- Onboarding ----- */
+VIEWS.onboard = () => {
+  html(`<div class="stack" style="padding-top:24px">
+    <div class="confetti">🇫🇷</div>
+    <h1 class="center">Bienvenue sur Parlons</h1>
+    <p class="center muted">Votre coach quotidien pour le TCF, de A1 à B2. Écoute, lecture, vocabulaire, grammaire, écrit et oral.</p>
+    <div class="card stack">
+      <h3>Quel est votre niveau actuel ?</h3>
+      ${[["A1","Je débute","Je connais quelques mots"],["A2","Je me débrouille","Je parle de ma vie quotidienne"],["B1","Intermédiaire","Je donne mon avis simplement"],["B2","Avancé","J'argumente avec nuance"]]
+        .map(([l,t,s])=>`<button class="list-item" data-lvl="${l}"><span class="pill">${l}</span><span class="grow"><span class="t">${t}</span><br><span class="s">${s}</span></span>›</button>`).join("")}
+      <button class="btn soft" data-go="#/placement">Je ne sais pas — faire le test (3 min)</button>
+    </div></div>`);
+  $$("[data-lvl]").forEach(b => b.onclick = () => { S.level=b.dataset.lvl; S.onboarded=true; save(); location.hash="#/home"; });
+};
+
+VIEWS.placement = () => {
+  const qs = []; for (const l of LEVELS){ const pool = shuffle(GRAMMAR.filter(g=>g.level===l).flatMap(g=>g.quiz)); qs.push(...pool.slice(0,4).map(q=>({q,l}))); }
+  let i=0; const right={A1:0,A2:0,B1:0,B2:0};
+  html(`${top("Test de placement", "#/onboard")}<div id="pz"></div>`);
+  const show = () => {
+    if (i>=qs.length){
+      let lvl="A1"; for (const l of LEVELS){ if (right[l]>=3) lvl=l; else break; }
+      S.level = lvl; S.onboarded = true; save();
+      $("#pz").innerHTML = `<div class="card stack center"><div class="confetti">🎯</div><h2>Votre niveau : ${lvl}</h2>
+        <p class="muted">${LEVELS.map(l=>`${l} : ${right[l]}/4`).join(" · ")}</p><p class="small muted">Vous pouvez le changer à tout moment dans Réglages.</p>
+        <button class="btn" data-go="#/home">Commencer</button></div>`; return;
+    }
+    const {q,l} = qs[i];
+    $("#pz").innerHTML = `<div class="bar" style="margin-bottom:14px"><i style="width:${i/qs.length*100}%"></i></div>
+      <div class="card"><span class="pill gray">${i+1}/${qs.length}</span><p class="fr" style="margin-top:10px">${esc(q[0])}</p>
+      ${q[1].map((o,k)=>`<button class="opt" data-k="${k}">${esc(o)}</button>`).join("")}
+      <button class="btn ghost" style="margin-top:12px" id="skip">Je ne sais pas</button></div>`;
+    $$("#pz .opt").forEach(b=>b.onclick=()=>{ if(+b.dataset.k===q[2]) right[l]++; i++; show(); });
+    $("#skip").onclick = () => { i++; show(); };
+  };
+  show();
+};
+
+/* ----- Home ----- */
+VIEWS.home = () => {
+  const steps = dailySteps(); const done = Object.keys(steps).length;
+  const dueCount = srsQueue(99).length;
+  const days = S.examDate ? Math.ceil((new Date(S.examDate+"T09:00") - Date.now())/DAY) : null;
+  const h = new Date().getHours(); const hello = h<5?"Bonne nuit":h<18?"Bonjour":"Bonsoir";
+  html(`
+  <div class="row between" style="margin:6px 0 14px">
+    <div><div class="muted small">${hello} 👋</div><h1>Parlons</h1></div>
+    <div class="row"><span class="pill red">🔥 ${S.streak}</span><span class="pill">⭐ ${S.xp}</span></div>
+  </div>
+  <div class="card hero stack">
+    <div class="row between"><span class="pill" style="background:rgba(255,255,255,.15);color:#fff">Niveau ${S.level}</span>${days!==null&&days>=0?`<span class="small muted">TCF dans ${days} j</span>`:""}</div>
+    <h2 style="color:#fff">Séance du jour</h2>
+    <div class="bar" style="background:rgba(255,255,255,.18)"><i style="width:${done/4*100}%;background:#fff"></i></div>
+    <div class="small muted">${done}/4 étapes · environ 15 minutes</div>
+    <button class="btn white" data-go="#/daily">${done===4?"Revoir la séance ✓":done?"Continuer":"Commencer"}</button>
+  </div>
+  <h3 style="margin:22px 0 10px">S'entraîner</h3>
+  <div class="grid2">
+    ${tile("#/vocab","🗂️","Vocabulaire",dueCount?`${dueCount} cartes à réviser`:"À jour !")}
+    ${tile("#/grammar","🧩","Grammaire",`${GRAMMAR.filter(g=>(S.grammar[g.id]?.best||0)>=.8).length}/${GRAMMAR.length} leçons`)}
+    ${tile("#/oral","🎧","Compréhension orale","Annonces, dialogues")}
+    ${tile("#/ecrit","📖","Compréhension écrite","Textes et documents")}
+    ${tile("#/dictee","✍️","Dictée","Écouter et écrire")}
+    ${tile("#/pron","🗣️","Prononciation","Le micro vous note")}
+    ${tile("#/write","📝","Expression écrite","Tâches 1, 2, 3")}
+    ${tile("#/speak","🎙️","Expression orale","Tâches 1, 2, 3")}
+  </div>
+  <button class="list-item" data-go="#/exam" style="margin-top:12px"><span style="font-size:24px">⏱️</span><span class="grow"><span class="t">Examen blanc</span><br><span class="s">Compréhension orale + écrite chronométrées, score /699 et NCLC estimés</span></span>›</button>
+  <div class="card" style="margin-top:12px">
+    <div class="row between"><h3>Progression ${S.level}</h3><span class="pill gray">${levelProgress(S.level)} %</span></div>
+    <div class="bar green" style="margin-top:10px"><i style="width:${levelProgress(S.level)}%"></i></div>
+    <p class="small muted" style="margin-top:8px">${levelProgress(S.level)>=80 && S.level!=="B2" ? `Prêt pour ${LEVELS[lvlIdx(S.level)+1]} ? Changez de niveau dans Réglages.` : "Vocabulaire maîtrisé, leçons réussies et exercices de compréhension."}</p>
+  </div>`);
+};
+const tile = (go, ico, t, s) => `<button class="tile" data-go="${go}"><span class="ico">${ico}</span><b>${t}</b><span>${s}</span></button>`;
+
+/* ----- Daily ----- */
+VIEWS.daily = () => {
+  const st = dailySteps();
+  const lesson = GRAMMAR.find(g=>upTo(S.level).includes(g.level) && (S.grammar[g.id]?.best||0)<.8) || shuffle(GRAMMAR.filter(g=>upTo(S.level).includes(g.level)))[0];
+  const oral = ORAL.find(o=>upTo(S.level).includes(o.level) && S.oral[o.id]===undefined) || shuffle(ORAL.filter(o=>upTo(S.level).includes(o.level)))[0];
+  const items = [
+    ["vocab","🗂️","Vocabulaire","Révisez vos cartes du jour","#/vocab"],
+    ["grammar","🧩","Grammaire",lesson.title,"#/grammar/"+lesson.id],
+    ["oral","🎧","Écoute",oral.context,"#/oral/"+oral.id],
+    ["speak","🗣️","Parler","Prononcez 3 phrases","#/pron"]];
+  html(`${top("Séance du jour")}
+  <p class="muted">Quatre étapes courtes. Faites-les dans l'ordre ou non : chacune se coche toute seule.</p>
+  ${items.map(([k,ico,t,s,go])=>`<button class="list-item" data-go="${go}"><span class="check ${st[k]?"done":""}">${st[k]?"✓":""}</span><span class="grow"><span class="t">${ico} ${t}</span><br><span class="s">${esc(s)}</span></span>›</button>`).join("")}
+  <div class="card" style="margin-top:14px"><b>Bonus de la semaine</b><p class="small muted">Une tâche d'expression écrite et une tâche orale par semaine suffisent pour progresser vers le B2.</p>
+  <div class="row"><button class="btn sm soft" data-go="#/write">📝 Écrire</button><button class="btn sm soft" data-go="#/speak">🎙️ Parler</button></div></div>`);
+};
+
+/* ----- Vocabulary ----- */
+VIEWS.vocab = () => {
+  const q = srsQueue(12);
+  html(`${top("Vocabulaire", "#/home", `<button class="btn sm ghost" data-go="#/words">Liste</button>`)}<div id="vz"></div>`);
+  const box = $("#vz");
+  if (!q.length){
+    box.innerHTML = `<div class="card center stack"><div class="confetti">✅</div><h2>Tout est révisé</h2><p class="muted">Revenez demain pour de nouvelles cartes, ou entraînez-vous librement.</p>
+      <button class="btn" id="extra">10 cartes au hasard</button></div>`;
+    $("#extra").onclick = () => run(shuffle(vocabPool()).slice(0,10), true); return;
+  }
+  run(q, false);
+  function run(queue, free){
+    let i=0, right=0; const total=queue.length; const again=[];
+    const next = () => {
+      if (i>=queue.length && again.length){ queue.push(...again.splice(0)); }
+      if (i>=queue.length){
+        addXP(total*2); if (total>=5) markDaily("vocab");
+        box.innerHTML = `<div class="card center stack"><div class="confetti">🎉</div><h2>Session terminée</h2><p class="muted">${right}/${total} du premier coup · +${total*2} XP</p>
+          <p class="small muted">${mastered()} mots maîtrisés · ${learned()} mots vus</p><button class="btn" data-go="#/home">Retour</button></div>`; return;
+      }
+      const w = queue[i++]; const c = S.srs[wordId(w)]; const box_ = c?.box||0;
+      const mode = !c ? "learn" : box_<=1 ? "recog" : box_===2 ? "listen" : (Math.random()<.5?"produce":"listen");
+      const header = `<div class="bar" style="margin-bottom:12px"><i style="width:${Math.min(100,(i-1)/total*100)}%"></i></div>`;
+      const finish = (q) => { if(!free) grade(w,q); if(q===0) again.push(w); else if (!again.includes(w)) right++; next(); };
+      const buttons = `<div class="grid2" style="grid-template-columns:1fr 1fr 1fr;margin-top:12px">
+        <button class="btn red sm" data-q="0">À revoir</button><button class="btn soft sm" data-q="1">Difficile</button><button class="btn green sm" data-q="2">Facile</button></div>`;
+      if (mode==="learn" || mode==="recog"){
+        box.innerHTML = `${header}<div class="card flash"><div class="face">
+          ${mode==="learn"?`<span class="pill green">Nouveau mot · ${w[2]}</span>`:`<span class="pill gray">${esc(w[3])}</span>`}
+          <div class="big-fr">${esc(w[0])}</div>${speakBtn(w[0])}
+          <div id="rev" style="display:${mode==="learn"?"block":"none"}"><p style="font-size:18px;margin-top:10px"><b>${esc(w[1])}</b></p>
+          <p class="fr" style="font-size:16px">${esc(w[4])} ${speakBtn(w[4])}</p></div>
+          ${mode==="recog"?`<button class="btn ghost" id="show" style="margin-top:12px">Afficher la réponse</button>`:""}
+        </div></div><div id="gb" style="display:${mode==="learn"?"block":"none"}">${mode==="learn"?`<button class="btn" data-q="1" style="margin-top:12px">Je l'ai noté →</button>`:buttons}</div>`;
+        setTimeout(()=>TTS.speak(w[0]),150);
+        const sh = $("#show"); if (sh) sh.onclick = () => { $("#rev").style.display="block"; sh.remove(); $("#gb").style.display="block"; };
+        $$("#gb [data-q]").forEach(b=>b.onclick=()=>finish(+b.dataset.q));
+      } else {
+        const prompt = mode==="listen" ? `<p class="muted">Écoutez et écrivez le mot ou l'expression</p><button class="mic" style="background:var(--blue);box-shadow:none" data-say="${esc(w[0])}">🔊</button>`
+          : `<p class="muted">Traduisez en français</p><div class="big-fr" style="font-size:26px">${esc(w[1])}</div><p class="small muted">Thème : ${esc(w[3])}</p>`;
+        box.innerHTML = `${header}<div class="card stack center">${prompt}
+          <input type="text" id="ans" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Votre réponse">
+          <div id="acc"></div><button class="btn" id="chk">Vérifier</button><div id="res"></div></div>`;
+        $("#acc").appendChild(accentBar($("#ans")));
+        if (mode==="listen") setTimeout(()=>TTS.speak(w[0]),200); else $("#ans").focus();
+        const check = () => {
+          const v = $("#ans").value.trim(); if (!v) return;
+          const target = w[0].replace(/\s*\(.*\)/,"");
+          const alts = target.split(/\s*\/\s*/);
+          const norm = s => words(s).join(" ").replace(/^(le|la|les|l'|un|une|des) /,"");
+          const exact = alts.some(a => norm(a)===norm(v));
+          const nearly = !exact && alts.some(a => strip(norm(a))===strip(norm(v)));
+          $("#chk").remove();
+          $("#res").innerHTML = `<div class="feedback ${exact?"ok":nearly?"info":"ko"}">${exact?"Parfait !":nearly?"Presque : attention aux accents.":"Pas tout à fait."}<br><b class="fr" style="font-size:18px">${esc(w[0])}</b> — ${esc(w[1])}<br><span class="small">${esc(w[4])}</span></div>
+            ${exact?`<button class="btn green" data-q="2" style="margin-top:10px">Suivant →</button>`:nearly?`<button class="btn" data-q="1" style="margin-top:10px">Suivant →</button>`:`<button class="btn" data-q="0" style="margin-top:10px">Suivant →</button>`}`;
+          TTS.speak(w[0]);
+          $$("#res [data-q]").forEach(b=>b.onclick=()=>finish(+b.dataset.q));
+        };
+        $("#chk").onclick = check; $("#ans").onkeydown = e => { if(e.key==="Enter") { e.preventDefault(); ($("#chk")?check():$("#res [data-q]")?.click()); } };
+      }
+    };
+    next();
+  }
+};
+VIEWS.words = () => {
+  html(`${top("Mots", "#/vocab")}<div class="seg" id="lv">${LEVELS.map(l=>`<button data-l="${l}" class="${l===S.level?"on":""}">${l}</button>`).join("")}</div><div id="wl"></div>`);
+  const show = l => {
+    $$("#lv button").forEach(b=>b.classList.toggle("on", b.dataset.l===l));
+    const list = VOCAB.filter(w=>w[2]===l);
+    $("#wl").innerHTML = `<p class="small muted" style="margin:10px 0">${mastered(l)} maîtrisés · ${learned(l)} vus · ${list.length} au total</p>` + list.map(w=>{
+      const b = S.srs[wordId(w)]?.box; const st = b===undefined?"gray":b>=4?"green":b>=2?"":"amber";
+      return `<div class="list-item">${speakBtn(w[0])}<span class="grow"><span class="t">${esc(w[0])}</span><br><span class="s">${esc(w[1])}</span></span><span class="pill ${st}">${b===undefined?"—":b>=4?"✓":"·".repeat(b+1)}</span></div>`; }).join("");
+  };
+  $$("#lv button").forEach(b=>b.onclick=()=>show(b.dataset.l)); show(S.level);
+};
+
+/* ----- Grammar ----- */
+VIEWS.grammar = (id) => {
+  if (id) return grammarLesson(id);
+  html(`${top("Grammaire")}<p class="muted">Les structures testées au TCF. Réussissez le quiz à 80 % pour valider une leçon.</p>` +
+    LEVELS.map(l=>`<h3 style="margin:18px 0 4px">${l} ${lvlIdx(l)>lvlIdx(S.level)?'<span class="pill gray">plus tard</span>':""}</h3>` +
+    GRAMMAR.filter(g=>g.level===l).map(g=>{ const b=S.grammar[g.id]?.best; return `<button class="list-item" data-go="#/grammar/${g.id}">
+      <span class="check ${b>=.8?"done":""}">${b>=.8?"✓":""}</span><span class="grow"><span class="t">${esc(g.title)}</span>${b!==undefined?`<br><span class="s">Meilleur score : ${Math.round(b*100)} %</span>`:""}</span>›</button>`; }).join("")).join(""));
+};
+function grammarLesson(id){
+  const g = GRAMMAR.find(x=>x.id===id); if (!g) return VIEWS.grammar();
+  html(`${top(esc(g.title), "#/grammar", `<span class="pill">${g.level}</span>`)}
+    <div class="card"><p style="font-size:16.5px">${g.summary}</p></div>
+    <div class="card" style="margin-top:12px"><h3>Exemples</h3>${g.examples.map(e=>`<div class="ex">${speakBtn(e)}<span class="fr" style="font-size:17px">${esc(e)}</span></div>`).join("")}</div>
+    <button class="btn" id="startq" style="margin-top:14px">Faire le quiz (${g.quiz.length} questions)</button><div id="qz"></div>`);
+  $("#startq").onclick = () => { $("#startq").remove(); quiz($("#qz"), g.quiz.map(q=>({q:q[0],opts:q[1],ans:q[2],why:q[3]})), score => {
+    const prev = S.grammar[g.id]?.best||0; S.grammar[g.id] = {best:Math.max(prev,score), last:today()}; save(); addXP(Math.round(score*10)); markDaily("grammar");
+  }); };
+}
+function quiz(el, items, onDone, {shuffleOpts=true, audio=false}={}){
+  items = shuffle(items).map(it => { if(!shuffleOpts) return it; const order = shuffle(it.opts.map((o,k)=>k)); return {...it, opts:order.map(k=>it.opts[k]), ans:order.indexOf(it.ans)}; });
+  let i=0, right=0;
+  const show = () => {
+    if (i>=items.length){ const sc = right/items.length; onDone(sc);
+      el.innerHTML = `<div class="card center stack" style="margin-top:14px"><div class="score-ring" style="background:${sc>=.8?"var(--green-soft)":"var(--amber-soft)"};color:${sc>=.8?"var(--green)":"var(--amber)"}">${right}/${items.length}</div>
+        <h3>${sc>=.8?"Leçon validée !":"Encore un petit effort"}</h3><button class="btn ${sc>=.8?"":"soft"}" id="again">${sc>=.8?"Refaire":"Réessayer"}</button><button class="btn ghost" data-go="#/grammar">Autres leçons</button></div>`;
+      $("#again",el).onclick = () => { i=0; right=0; items=shuffle(items); show(); }; return; }
+    const it = items[i];
+    el.innerHTML = `<div class="card" style="margin-top:14px"><div class="row between"><span class="pill gray">${i+1}/${items.length}</span>${audio?speakBtn(it.q.replace(/___/g,"…")):""}</div>
+      <p class="fr" style="margin-top:10px">${esc(it.q)}</p>${it.opts.map((o,k)=>`<button class="opt" data-k="${k}">${esc(o)}</button>`).join("")}<div id="fb"></div></div>`;
+    $$(".opt",el).forEach(b=>b.onclick=()=>{
+      const k=+b.dataset.k, ok = k===it.ans; if(ok) right++;
+      $$(".opt",el).forEach((x,j)=>{ x.disabled=true; if(j===it.ans) x.classList.add("correct"); else if(j===k) x.classList.add("wrong"); });
+      const full = it.q.replace("___", it.opts[it.ans]);
+      $("#fb",el).innerHTML = `<div class="feedback ${ok?"ok":"ko"}">${ok?"✓ Correct.":"✗ La bonne réponse : <b>"+esc(it.opts[it.ans])+"</b>."} ${esc(it.why||"")}</div>
+        <div class="row" style="margin-top:10px">${it.q.includes("___")?speakBtn(full):""}<button class="btn" id="nx">Suivant →</button></div>`;
+      $("#nx",el).onclick = () => { i++; show(); };
+    });
+  };
+  show();
+}
+
+/* ----- Comprehension (oral + écrit) ----- */
+function compList(kind){
+  const data = kind==="oral"?ORAL:ECRIT, store = S[kind];
+  html(`${top(kind==="oral"?"Compréhension orale":"Compréhension écrite")}
+    <p class="muted">${kind==="oral"?"Au TCF, chaque document n'est entendu qu'une fois : essayez d'abord sans réécouter.":"Lisez le document, puis répondez. Au TCF : 39 questions en 60 minutes."}</p>` +
+    LEVELS.map(l=>`<h3 style="margin:18px 0 4px">${l}</h3>`+data.filter(x=>x.level===l).map(x=>{ const s=store[x.id];
+      return `<button class="list-item" data-go="#/${kind}/${x.id}"><span class="check ${s>=.5?"done":""}">${s>=.5?"✓":""}</span><span class="grow"><span class="t">${esc(x.context)}</span><br><span class="s">${x.questions.length} questions${s!==undefined?` · ${Math.round(s*100)} %`:""}</span></span>›</button>`; }).join("")).join(""));
+}
+function compItem(kind, id){
+  const data = kind==="oral"?ORAL:ECRIT; const x = data.find(d=>d.id===id); if(!x) return compList(kind);
+  let plays = 0;
+  html(`${top(esc(x.context), "#/"+kind, `<span class="pill">${x.level}</span>`)}
+    ${kind==="oral" ? `<div class="card center stack">
+        <button class="mic" id="play" style="background:var(--blue);box-shadow:0 6px 20px rgba(35,70,201,.3)">▶</button>
+        <div class="small muted" id="pc">Appuyez pour écouter</div>
+        <div class="row" style="justify-content:center"><button class="btn sm ghost" id="slow">🐢 Plus lent</button><button class="btn sm ghost" id="stop">■ Stop</button></div>
+        <p class="small muted">Pas de son ? Vérifiez que le mode silencieux est désactivé.</p></div>`
+      : `<div class="card"><div class="passage">${esc(x.text)}</div></div>`}
+    <div id="qs"></div><div id="tr"></div>`);
+  if (kind==="oral"){
+    const play = rate => { plays++; $("#pc").textContent = plays===1?"Écoute n° 1":"Écoute n° "+plays+" (à l'examen : une seule)"; TTS.speak(x.text, {rate, btn:$("#play")}); };
+    $("#play").onclick = () => play(); $("#slow").onclick = () => play(0.72); $("#stop").onclick = () => TTS.stop();
+  }
+  const answers = [];
+  $("#qs").innerHTML = x.questions.map((q,qi)=>`<div class="card" style="margin-top:12px" data-qi="${qi}"><p style="font-weight:600">${qi+1}. ${esc(q[0])}</p>
+    ${q[1].map((o,k)=>`<button class="opt" data-k="${k}">${esc(o)}</button>`).join("")}</div>`).join("");
+  $$("#qs [data-qi]").forEach(card => { const qi=+card.dataset.qi, q=x.questions[qi];
+    $$(".opt",card).forEach(b=>b.onclick=()=>{ const k=+b.dataset.k; answers[qi]=k===q[2];
+      $$(".opt",card).forEach((o,j)=>{o.disabled=true; if(j===q[2]) o.classList.add("correct"); else if(j===k) o.classList.add("wrong");});
+      if (answers.filter(a=>a!==undefined).length===x.questions.length){
+        const sc = answers.filter(Boolean).length/x.questions.length; S[kind][x.id]=Math.max(S[kind][x.id]||0,sc); save(); addXP(Math.round(sc*12));
+        if (kind==="oral") markDaily("oral");
+        $("#tr").innerHTML = `<div class="feedback ${sc>=.5?"ok":"ko"}">Score : ${Math.round(sc*100)} %</div>` +
+          (kind==="oral" ? `<details class="card" style="margin-top:12px"><summary>Voir la transcription</summary><div class="passage" style="margin-top:8px">${esc(x.text.replace(/^A: /gm,"— ").replace(/^B: /gm,"— "))}</div></details>` : "") +
+          `<button class="btn" style="margin-top:12px" data-go="#/${kind}">Document suivant</button>`;
+      }
+    }); });
+}
+VIEWS.oral = id => id ? compItem("oral", id) : compList("oral");
+VIEWS.ecrit = id => id ? compItem("ecrit", id) : compList("ecrit");
+
+/* ----- Dictée ----- */
+VIEWS.dictee = () => {
+  const pool = shuffle(SENTENCES.filter(s=>upTo(S.level).includes(s.level)));
+  let i = 0;
+  html(`${top("Dictée")}<p class="muted">Écoutez, puis écrivez exactement ce que vous entendez, avec les accents.</p><div id="dz"></div>`);
+  const show = () => {
+    const s = pool[i % pool.length];
+    $("#dz").innerHTML = `<div class="card stack center"><span class="pill">${s.level}</span>
+      <div class="row" style="justify-content:center"><button class="mic" style="background:var(--blue);box-shadow:none" data-say="${esc(s.fr)}">🔊</button></div>
+      <button class="btn sm ghost" data-say="${esc(s.fr)}" data-rate="0.65" style="margin:0 auto">🐢 Lentement</button>
+      <textarea id="dt" style="min-height:110px" autocapitalize="sentences" placeholder="Écrivez ici…"></textarea><div id="acc"></div>
+      <button class="btn" id="chk">Vérifier</button><div id="res"></div></div>`;
+    $("#acc").appendChild(accentBar($("#dt")));
+    setTimeout(()=>TTS.speak(s.fr),200);
+    $("#chk").onclick = () => {
+      const v = $("#dt").value; if(!v.trim()) return;
+      const r = compare(s.fr, v, {accents:true});
+      S.dictee.n++; S.dictee.sum += r.score; save(); addXP(Math.round(r.score/10));
+      $("#chk").remove();
+      $("#res").innerHTML = `<div class="feedback ${r.score>=80?"ok":r.score>=50?"info":"ko"}"><b>${r.score} %</b>${r.acc?` · ${r.acc} erreur(s) d'accent`:""}</div>
+        <div class="card" style="text-align:left;margin-top:10px"><div class="fr" style="font-size:18px">${renderTokens(r.tokens)}</div><hr><div class="small muted">Correction</div><div class="fr" style="font-size:18px">${esc(s.fr)}</div></div>
+        <button class="btn" id="nx" style="margin-top:10px">Phrase suivante →</button>`;
+      $("#nx").onclick = () => { i++; show(); };
+    };
+  };
+  show();
+};
+
+/* ----- Pronunciation ----- */
+VIEWS.pron = () => {
+  const pool = shuffle(SENTENCES.filter(s=>upTo(S.level).includes(s.level)));
+  let i = 0, sessionDone = 0;
+  html(`${top("Prononciation")}<p class="muted">Écoutez le modèle, appuyez sur le micro et répétez. Les mots en vert ont été reconnus.</p><div id="pz"></div>`);
+  if (!SR){ $("#pz").innerHTML = `<div class="feedback ko">La reconnaissance vocale n'est pas disponible dans ce navigateur. Sur iPhone, utilisez Safari ; sur Android, Chrome. Vous pouvez quand même écouter et répéter.</div>`; }
+  let rec = null;
+  const show = () => {
+    const s = pool[i % pool.length];
+    $("#pz").insertAdjacentHTML("beforeend","");
+    const box = document.createElement("div"); box.className="card stack center"; box.id="pcard";
+    box.innerHTML = `<div class="row between"><span class="pill">${s.level}</span><span class="pill gray">${esc(s.focus)}</span></div>
+      <p class="fr" style="font-size:22px">${esc(s.fr)}</p>
+      <div class="row" style="justify-content:center">${speakBtn(s.fr)}<button class="btn sm ghost" data-say="${esc(s.fr)}" data-rate="0.65">🐢</button></div>
+      ${SR?`<button class="mic" id="mic">🎤</button><div class="small muted" id="hint">Appuyez, parlez, puis appuyez à nouveau</div>`:""}
+      <div class="transcript" id="tx"></div><div id="res"></div>`;
+    const old = $("#pcard"); old ? old.replaceWith(box) : $("#pz").appendChild(box);
+    if (!SR) { box.insertAdjacentHTML("beforeend", `<button class="btn" id="nx">Suivante →</button>`); $("#nx").onclick=()=>{i++;show();}; return; }
+    const finish = (text) => {
+      $("#mic").classList.remove("on"); $("#mic").textContent="🎤";
+      if (!text.trim()) { $("#hint").textContent = "Rien entendu. Réessayez, plus près du micro."; return; }
+      const r = compare(s.fr, text, {accents:false});
+      $("#tx").innerHTML = renderTokens(r.tokens);
+      S.pron.n++; S.pron.sum += r.score; save(); addXP(Math.round(r.score/10)); sessionDone++; if (sessionDone>=3) markDaily("speak");
+      $("#res").innerHTML = `<div class="feedback ${r.score>=85?"ok":r.score>=60?"info":"ko"}"><b>${r.score} %</b> · ${r.score>=85?"Excellent !":r.score>=60?"Bien, encore un essai ?":"Écoutez le modèle lentement, puis réessayez."}</div>
+        <div class="row" style="margin-top:10px"><button class="btn ghost" id="retry">↻ Réessayer</button><button class="btn" id="nx">Suivante →</button></div>`;
+      $("#retry").onclick = () => { $("#res").innerHTML=""; $("#tx").innerHTML=""; $("#hint").textContent="Appuyez, parlez, puis appuyez à nouveau"; };
+      $("#nx").onclick = () => { i++; show(); };
+    };
+    $("#mic").onclick = () => {
+      if (rec && rec.active){ rec.stop(); return; }
+      TTS.stop(); $("#res").innerHTML=""; $("#tx").textContent="…";
+      rec = makeRecognizer({continuous:false, onText:(f,interim)=>{ $("#tx").textContent = (f+" "+interim).trim(); }, onEnd: t => finish(t || $("#tx").textContent.replace(/^…$/,"")) });
+      if (!rec) return; rec.start(); $("#mic").classList.add("on"); $("#mic").textContent="■"; $("#hint").textContent="Je vous écoute…";
+    };
+  };
+  show();
+  onLeave(()=>rec && rec.stop());
+};
+
+/* ----- Expression écrite ----- */
+VIEWS.write = (id) => {
+  if (!id){
+    html(`${top("Expression écrite")}<div class="card small"><b>Format TCF Canada</b> · 60 minutes pour 3 tâches.<br>Tâche 1 : message (60–120 mots) · Tâche 2 : article ou récit (120–150 mots) · Tâche 3 : comparer deux points de vue et donner son avis (120–180 mots).</div>` +
+      [1,2,3].map(t=>`<h3 style="margin:18px 0 4px">Tâche ${t}</h3>`+WRITING.filter(w=>w.task===t).map(w=>{ const last=[...S.writing].reverse().find(x=>x.id===w.id);
+        return `<button class="list-item" data-go="#/write/${w.id}"><span class="check ${last?"done":""}">${last?"✓":""}</span><span class="grow"><span class="s">${esc(w.prompt.slice(0,110))}…</span>${last?.score!=null?`<br><span class="pill green" style="margin-top:4px">${last.score}/20</span>`:""}</span>›</button>`; }).join("")).join(""));
+    return;
+  }
+  const w = WRITING.find(x=>x.id===id); if(!w) return VIEWS.write();
+  const draftKey = "draft-"+w.id; let draft=""; try{ draft = localStorage.getItem(draftKey)||""; }catch(e){}
+  html(`${top("Tâche "+w.task, "#/write", `<span class="timer" id="tm">${w.minutes}:00</span>`)}
+    <div class="card"><p class="fr" style="font-size:17.5px">${esc(w.prompt)}</p>
+    ${w.docs?w.docs.map(d=>`<div class="feedback info" style="color:var(--ink)">${esc(d)}</div>`).join(""):""}
+    <details style="margin-top:10px"><summary>Conseils</summary><ul style="margin:6px 0 0;padding-left:20px">${w.tips.map(t=>`<li>${esc(t)}</li>`).join("")}</ul></details></div>
+    <div class="row between" style="margin-top:14px"><button class="btn sm soft" id="go">⏱ Lancer le chrono (${w.minutes} min)</button><span class="pill gray" id="wc">0 mot</span></div>
+    <textarea id="tx" style="margin-top:10px" placeholder="Rédigez votre texte ici…">${esc(draft)}</textarea><div id="acc"></div>
+    ${w.model?`<details class="card" style="margin-top:12px"><summary>Voir un exemple de réponse</summary><div class="passage" style="margin-top:8px">${esc(w.model)}</div></details>`:""}
+    <div id="gp" style="margin-top:12px"></div>`);
+  const tx = $("#tx"); $("#acc").appendChild(accentBar(tx));
+  const count = () => { const n = (tx.value.match(/[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu)||[]).length;
+    const el=$("#wc"); el.textContent = n+" mot"+(n>1?"s":"")+` · ${w.min}–${w.max}`; el.className = "pill "+(n<w.min?"gray":n<=w.max?"green":"red");
+    try{ localStorage.setItem(draftKey, tx.value); }catch(e){} return n; };
+  tx.addEventListener("input", count); count();
+  let timer=null; $("#go").onclick = () => { let left=w.minutes*60; $("#go").disabled=true; clearInterval(timer);
+    timer=setInterval(()=>{ left--; const m=Math.floor(Math.max(0,left)/60), s=Math.max(0,left)%60; $("#tm").textContent=`${m}:${String(s).padStart(2,"0")}`; $("#tm").classList.toggle("warn", left<=60);
+      if(left<=0){ clearInterval(timer); toast("Temps écoulé ! Relisez votre texte."); } },1000); };
+  onLeave(()=>clearInterval(timer));
+  gradingPanel($("#gp"), "write", w, ()=>tx.value, (score, fb) => {
+    S.writing.push({id:w.id, task:w.task, date:today(), words:count(), score, text:tx.value.slice(0,3000)}); if (S.writing.length>60) S.writing.shift(); save(); addXP(30);
+  });
+};
+
+/* ----- Expression orale ----- */
+VIEWS.speak = (id) => {
+  if (!id){
+    html(`${top("Expression orale")}<div class="card small"><b>Format TCF Canada</b> · 12 minutes face à un examinateur.<br>Tâche 1 : entretien dirigé (2 min) · Tâche 2 : interaction, vous posez les questions (5 min 30 dont 2 min de préparation) · Tâche 3 : exprimer un point de vue (4 min 30).</div>` +
+      [1,2,3].map(t=>`<h3 style="margin:18px 0 4px">Tâche ${t}</h3>`+SPEAKING.filter(s=>s.task===t).map(s=>{ const last=[...S.speaking].reverse().find(x=>x.id===s.id);
+        return `<button class="list-item" data-go="#/speak/${s.id}"><span class="check ${last?"done":""}">${last?"✓":""}</span><span class="grow"><span class="s">${esc(s.prompt.slice(0,110))}${s.prompt.length>110?"…":""}</span>${last?.score!=null?`<br><span class="pill green" style="margin-top:4px">${last.score}/20</span>`:""}</span>›</button>`; }).join("")).join(""));
+    return;
+  }
+  const t = SPEAKING.find(x=>x.id===id); if(!t) return VIEWS.speak();
+  const conv = t.task===2 && S.settings.apiKey && SR;
+  html(`${top("Tâche "+t.task, "#/speak", `<span class="timer" id="tm">${fmt(t.prep||t.seconds)}</span>`)}
+    <div class="card"><p class="fr" style="font-size:17.5px">${esc(t.prompt)}</p>${speakBtn(t.prompt)}
+    <details style="margin-top:10px"><summary>Conseils</summary><ul style="margin:6px 0 0;padding-left:20px">${t.tips.map(x=>`<li>${esc(x)}</li>`).join("")}</ul></details>
+    ${t.questions?`<details style="margin-top:6px"><summary>Exemples de questions</summary><ul style="margin:6px 0 0;padding-left:20px">${t.questions.map(x=>`<li class="fr" style="font-size:16px">${esc(x)}</li>`).join("")}</ul></details>`:""}</div>
+    ${t.task===2?`<div class="feedback info small">${conv?"Mode conversation : l'IA joue l'examinateur et vous répond à voix haute. Posez une question, puis arrêtez le micro.":"Posez vos questions à voix haute comme si l'examinateur était devant vous. Ajoutez une clé API dans Réglages pour que l'IA vous réponde."}</div>`:""}
+    <div class="card center stack" style="margin-top:12px" id="stage">
+      ${t.prep?`<p class="muted">Préparation : ${t.prep/60} min. Notez vos idées.</p><button class="btn" id="prep">Commencer la préparation</button><button class="btn ghost" id="skip">Passer et parler</button>`:`<button class="btn" id="startTalk">🎙️ Commencer</button>`}
+    </div>
+    <div id="after"></div>`);
+  let timer=null, rec=null, media=null, chunks=[], audioURL=null, startedAt=0, transcript="", history=[], busy=false;
+  const clear = () => { clearInterval(timer); rec && rec.stop(); try{ media && media.state!=="inactive" && media.stop(); }catch(e){} };
+  onLeave(clear);
+  const countdown = (secs, onEnd) => { let left=secs; clearInterval(timer); $("#tm").textContent=fmt(left);
+    timer=setInterval(()=>{ left--; $("#tm").textContent=fmt(Math.max(0,left)); $("#tm").classList.toggle("warn",left<=20); if(left<=0){ clearInterval(timer); onEnd(); } },1000); };
+  const startTalk = async () => {
+    $("#stage").innerHTML = `<button class="mic on" id="mic">■</button><div class="small muted" id="st">${conv?"Parlez… (appuyez pour envoyer)":"Parlez… appuyez pour terminer"}</div>
+      <div class="transcript" id="live" style="text-align:left"></div>${conv?`<div id="dlg" style="text-align:left"></div><button class="btn ghost sm" id="end" style="margin:0 auto">Terminer l'échange</button>`:""}`;
+    startedAt = Date.now(); countdown(t.seconds, () => stopAll());
+    try { const stream = await navigator.mediaDevices.getUserMedia({audio:true}); media = new MediaRecorder(stream); chunks=[];
+      media.ondataavailable = e => e.data.size && chunks.push(e.data); media.onstop = () => { stream.getTracks().forEach(tr=>tr.stop()); if(chunks.length){ audioURL = URL.createObjectURL(new Blob(chunks,{type:media.mimeType||"audio/mp4"})); const a=$("#playback"); if(a) a.src=audioURL; } };
+      media.start(); } catch(e){ /* recording optional */ }
+    if (!SR){ $("#live").innerHTML = `<span class="muted small">Transcription indisponible ici. Votre voix est quand même enregistrée.</span>`; }
+    if (conv){ listenTurn(); $("#end").onclick = () => stopAll(); $("#mic").onclick = () => { if (rec && rec.active) rec.stop(); else if(!busy) listenTurn(); }; }
+    else { if (SR){ rec = makeRecognizer({continuous:true, onText:(f,i)=>{ transcript=f; $("#live").textContent=(f+" "+i).trim(); }}); rec.start(); } $("#mic").onclick = () => stopAll(); }
+  };
+  const listenTurn = () => {
+    $("#mic").classList.add("on"); $("#mic").textContent="■"; $("#st").textContent="Parlez… (appuyez pour envoyer)";
+    rec = makeRecognizer({continuous:false, onText:(f,i)=>{ $("#live").textContent=(f+" "+i).trim(); }, onEnd: async said => {
+      $("#mic").classList.remove("on"); $("#mic").textContent="🎤";
+      said = said || $("#live").textContent; if (!said.trim()) { $("#st").textContent="Rien entendu. Appuyez pour réessayer."; return; }
+      history.push({role:"user",content:said}); transcript += (transcript?"\n":"")+"Moi : "+said;
+      $("#dlg").insertAdjacentHTML("beforeend", `<p><b>Vous :</b> ${esc(said)}</p>`); $("#live").textContent=""; busy=true; $("#st").textContent="L'examinateur répond…";
+      try { const reply = await chatWithAPI(`Tu es l'examinateur du TCF Canada, expression orale tâche 2. Tu joues le rôle décrit ici : ${t.prompt} Le candidat te pose des questions. Réponds en français, en 1 à 3 phrases courtes et naturelles, avec des détails concrets inventés et cohérents. Ne corrige pas le candidat et ne pose pas de questions sauf si nécessaire.`, history);
+        history.push({role:"assistant",content:reply}); transcript += "\nExaminateur : "+reply;
+        $("#dlg").insertAdjacentHTML("beforeend", `<p class="fr" style="font-size:16px"><b>Examinateur :</b> ${esc(reply)}</p>`);
+        TTS.speak(reply, {onend:()=>{ busy=false; $("#st").textContent="À vous. Appuyez sur le micro."; }});
+      } catch(e){ busy=false; $("#st").textContent="Erreur API. Vérifiez la clé."; }
+    }});
+    rec.start();
+  };
+  const stopAll = () => {
+    if (!$("#stage")) return; clear();
+    const secs = Math.round((Date.now()-startedAt)/1000);
+    const text = conv ? transcript : (transcript || $("#live")?.textContent || "");
+    const wc = (text.match(/\p{L}+/gu)||[]).length; const wpm = secs ? Math.round(wc/(secs/60)) : 0;
+    const fillers = (text.toLowerCase().match(/\b(euh+|heu+|bah|ben|genre|du coup|en fait|tu vois)\b/g)||[]).length;
+    $("#stage").innerHTML = `<h3>Terminé · ${fmt(secs)}</h3>
+      <div class="grid2" style="grid-template-columns:repeat(3,1fr)"><div class="stat"><b>${wc}</b><span>mots</span></div><div class="stat"><b>${wpm}</b><span>mots/min</span></div><div class="stat"><b>${fillers}</b><span>hésitations</span></div></div>
+      <audio id="playback" controls style="width:100%" ${audioURL?`src="${audioURL}"`:""}></audio>
+      <p class="small muted" style="text-align:left">Transcription (corrigez si la reconnaissance s'est trompée) :</p>
+      <textarea id="ft" style="min-height:140px">${esc(text)}</textarea>
+      <button class="btn ghost" data-go="#/speak/${t.id}">↻ Recommencer</button>`;
+    gradingPanel($("#after"), "speak", t, ()=>$("#ft").value, score => { S.speaking.push({id:t.id, task:t.task, date:today(), score, words:wc}); if(S.speaking.length>60) S.speaking.shift(); save(); addXP(30); markDaily("speak"); });
+    addXP(10); markDaily("speak");
+  };
+  const sb = $("#startTalk"); if (sb) sb.onclick = startTalk;
+  const pb = $("#prep"); if (pb) pb.onclick = () => { pb.remove(); $("#skip").textContent="J'ai fini, je parle"; countdown(t.prep, () => startTalk()); };
+  const sk = $("#skip"); if (sk) sk.onclick = () => { clearInterval(timer); startTalk(); };
+};
+const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+
+/* ----- Mock exam ----- */
+VIEWS.exam = () => {
+  const hist = S.exams.slice(-5).reverse();
+  html(`${top("Examen blanc")}
+    <div class="card stack"><p>Deux épreuves chronométrées comme au TCF, avec des documents de difficulté croissante (A1 → B2).</p>
+    <div class="list-item" style="cursor:default"><span>🎧</span><span class="grow"><span class="t">Compréhension orale</span><br><span class="s">≈ 12 questions · 12 min · une seule écoute</span></span></div>
+    <div class="list-item" style="cursor:default"><span>📖</span><span class="grow"><span class="t">Compréhension écrite</span><br><span class="s">≈ 12 questions · 18 min</span></span></div>
+    <button class="btn" id="go">Commencer l'examen</button>
+    <p class="small muted">Le score sur 699 et le niveau NCLC sont des estimations pour suivre vos progrès, pas une note officielle.</p></div>
+    ${hist.length?`<h3 style="margin:18px 0 6px">Historique</h3>`+hist.map(e=>`<div class="list-item" style="cursor:default"><span class="grow"><span class="t">${e.date}</span><br><span class="s">CO ${e.co}/699 (NCLC ${e.nco}) · CE ${e.ce}/699 (NCLC ${e.nce})</span></span><span class="pill">${e.cefr}</span></div>`).join(""):""}
+    <hr><h3>Écrit et oral</h3><p class="small muted">Pour simuler les épreuves de production, enchaînez les tâches 1, 2 et 3 en respectant le chrono.</p>
+    <div class="row"><button class="btn sm soft" data-go="#/write">📝 Expression écrite</button><button class="btn sm soft" data-go="#/speak">🎙️ Expression orale</button></div>`);
+  $("#go").onclick = () => runExam();
+};
+function pickExamItems(data, target){
+  const out=[]; let n=0;
+  for (const l of LEVELS){ const items = shuffle(data.filter(d=>d.level===l)); let k=0; while(k<items.length && n < target*(lvlIdx(l)+1)/4){ out.push(items[k]); n+=items[k].questions.length; k++; } }
+  return out;
+}
+function runExam(){
+  const parts = [{kind:"oral",label:"Compréhension orale",items:pickExamItems(ORAL,12),secs:12*60},{kind:"ecrit",label:"Compréhension écrite",items:pickExamItems(ECRIT,12),secs:18*60}];
+  const res = {oral:[],ecrit:[]}; let p=0, timer=null;
+  onLeave(()=>clearInterval(timer));
+  const W = {A1:1,A2:2,B1:3,B2:4};
+  const startPart = () => {
+    if (p>=parts.length) return results();
+    const part = parts[p]; let it=0, left=part.secs;
+    app.innerHTML = `${top(part.label, "#/exam", `<span class="timer" id="tm">${fmt(left)}</span>`)}<div id="ez"></div>`;
+    clearInterval(timer); timer=setInterval(()=>{ left--; $("#tm").textContent=fmt(Math.max(0,left)); $("#tm").classList.toggle("warn",left<=60); if(left<=0){ clearInterval(timer); toast("Temps écoulé"); p++; startPart(); } },1000);
+    const showItem = () => {
+      if (it>=part.items.length){ clearInterval(timer); p++; TTS.stop();
+        app.innerHTML = `<div class="card center stack" style="margin-top:30px"><h2>${part.label} terminée</h2>${p<parts.length?`<button class="btn" id="nx">Épreuve suivante →</button>`:`<button class="btn" id="nx">Voir mes résultats</button>`}</div>`;
+        $("#nx").onclick = startPart; return; }
+      const x = part.items[it]; const qsAnswered = [];
+      $("#ez").innerHTML = `<span class="pill gray">Document ${it+1}/${part.items.length}</span> <span class="pill">${esc(x.context)}</span>
+        ${part.kind==="oral"?`<div class="card center" style="margin-top:10px"><button class="mic" id="pl" style="background:var(--blue);box-shadow:none">▶</button><div class="small muted" id="pc">Une seule écoute</div></div>`:`<div class="card" style="margin-top:10px"><div class="passage">${esc(x.text)}</div></div>`}
+        ${x.questions.map((q,qi)=>`<div class="card" style="margin-top:10px" data-qi="${qi}"><p style="font-weight:600">${esc(q[0])}</p>${q[1].map((o,k)=>`<button class="opt" data-k="${k}">${esc(o)}</button>`).join("")}</div>`).join("")}
+        <button class="btn" id="nxt" style="margin-top:12px" disabled>Suivant →</button>`;
+      if (part.kind==="oral"){ let used=false; $("#pl").onclick=()=>{ if(used) return; used=true; $("#pl").disabled=true; $("#pl").style.opacity=.4; $("#pc").textContent="Écoute en cours…"; TTS.speak(x.text,{onend:()=>$("#pc").textContent="Répondez aux questions"}); }; }
+      $$("#ez [data-qi]").forEach(card=>{ const qi=+card.dataset.qi;
+        $$(".opt",card).forEach(b=>b.onclick=()=>{ $$(".opt",card).forEach(o=>o.style.borderColor=""); b.style.borderColor="var(--blue)"; qsAnswered[qi]=+b.dataset.k;
+          if (qsAnswered.filter(v=>v!==undefined).length===x.questions.length) $("#nxt").disabled=false; }); });
+      $("#nxt").onclick = () => { x.questions.forEach((q,qi)=>res[part.kind].push({ok:qsAnswered[qi]===q[2], w:W[x.level]})); TTS.stop(); it++; showItem(); window.scrollTo(0,0); };
+    };
+    showItem();
+  };
+  const toScore = arr => { const tot=arr.reduce((a,b)=>a+b.w,0)||1, got=arr.filter(a=>a.ok).reduce((a,b)=>a+b.w,0); return Math.round(100 + 500*got/tot); };
+  const nclc = (sc, tbl) => { for (const [min,n] of tbl) if (sc>=min) return n; return sc>=300?"< 4":"—"; };
+  const cefr = sc => sc>=600?"C2":sc>=500?"C1":sc>=400?"B2":sc>=300?"B1":sc>=200?"A2":"A1";
+  const results = () => {
+    const co=toScore(res.oral), ce=toScore(res.ecrit); const e={date:today(),co,ce,nco:nclc(co,NCLC.co),nce:nclc(ce,NCLC.ce),cefr:cefr(Math.round((co+ce)/2))};
+    S.exams.push(e); save(); addXP(50);
+    app.innerHTML = `${top("Résultats", "#/exam")}<div class="card center stack"><div class="confetti">📊</div><h2>Niveau estimé : ${e.cefr}</h2>
+      <div class="grid2"><div class="card"><div class="stat"><span>Compréhension orale</span><b>${co}</b><span>/699 · ${cefr(co)} · NCLC ${e.nco}</span></div></div>
+      <div class="card"><div class="stat"><span>Compréhension écrite</span><b>${ce}</b><span>/699 · ${cefr(ce)} · NCLC ${e.nce}</span></div></div></div>
+      <p class="small muted">${res.oral.filter(a=>a.ok).length}/${res.oral.length} bonnes réponses à l'oral, ${res.ecrit.filter(a=>a.ok).length}/${res.ecrit.length} à l'écrit. Ce test ne va pas au-delà du B2, donc 600 est le maximum.</p>
+      <button class="btn" data-go="#/home">Retour à l'accueil</button></div>`;
+  };
+  startPart();
+}
+
+/* ----- Progress ----- */
+VIEWS.progress = () => {
+  const last14 = [...Array(14)].map((_,k)=>{ const d=new Date(Date.now()-(13-k)*DAY); const key=d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); return {d, xp:S.days[key]||0}; });
+  const mx = Math.max(20, ...last14.map(x=>x.xp));
+  const avg = a => a.length ? Math.round(a.reduce((x,y)=>x+y,0)/a.length*10)/10 : "—";
+  html(`${top("Progrès")}
+    <div class="card"><div class="grid2" style="grid-template-columns:repeat(3,1fr)">
+      <div class="stat"><b>🔥 ${S.streak}</b><span>jours de suite</span></div><div class="stat"><b>${S.xp}</b><span>XP total</span></div><div class="stat"><b>${mastered()}</b><span>mots maîtrisés</span></div></div></div>
+    <div class="card" style="margin-top:12px"><h3>14 derniers jours</h3>
+      <div style="display:flex;align-items:flex-end;gap:5px;height:90px;margin-top:12px">${last14.map(x=>`<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px"><div style="width:100%;height:${Math.max(3,x.xp/mx*70)}px;background:${x.xp?"var(--blue)":"var(--line)"};border-radius:5px"></div><span style="font-size:10px" class="muted">${x.d.getDate()}</span></div>`).join("")}</div></div>
+    <div class="card" style="margin-top:12px"><h3>Niveaux</h3>${LEVELS.map(l=>`<div style="margin-top:12px"><div class="row between"><b>${l}</b><span class="small muted">${levelProgress(l)} %</span></div><div class="bar green" style="margin-top:6px"><i style="width:${levelProgress(l)}%"></i></div></div>`).join("")}</div>
+    <div class="card" style="margin-top:12px"><h3>Compétences</h3>
+      <div class="list-item" style="cursor:default">🎧<span class="grow">Compréhension orale</span><b>${Object.keys(S.oral).length}/${ORAL.length}</b></div>
+      <div class="list-item" style="cursor:default">📖<span class="grow">Compréhension écrite</span><b>${Object.keys(S.ecrit).length}/${ECRIT.length}</b></div>
+      <div class="list-item" style="cursor:default">✍️<span class="grow">Dictée (moyenne)</span><b>${S.dictee.n?Math.round(S.dictee.sum/S.dictee.n)+" %":"—"}</b></div>
+      <div class="list-item" style="cursor:default">🗣️<span class="grow">Prononciation (moyenne)</span><b>${S.pron.n?Math.round(S.pron.sum/S.pron.n)+" %":"—"}</b></div>
+      <div class="list-item" style="cursor:default">📝<span class="grow">Expression écrite</span><b>${avg(S.writing.filter(w=>w.score!=null).map(w=>w.score))}/20</b></div>
+      <div class="list-item" style="cursor:default">🎙️<span class="grow">Expression orale</span><b>${avg(S.speaking.filter(w=>w.score!=null).map(w=>w.score))}/20</b></div>
+    </div>
+    ${S.exams.length?`<div class="card" style="margin-top:12px"><h3>Dernier examen blanc</h3><p>${(e=>`${e.date} · CO ${e.co} · CE ${e.ce} · <b>${e.cefr}</b>`)(S.exams[S.exams.length-1])}</p></div>`:""}`);
+};
+
+/* ----- Settings ----- */
+VIEWS.settings = () => {
+  const vs = TTS.load();
+  html(`${top("Réglages")}
+    <div class="card stack"><h3>Niveau et objectif</h3>
+      <div class="seg" id="lv">${LEVELS.map(l=>`<button data-l="${l}" class="${l===S.level?"on":""}">${l}</button>`).join("")}</div>
+      <label class="small muted">Date de votre TCF</label><input type="text" id="ed" placeholder="AAAA-MM-JJ" value="${esc(S.examDate)}" inputmode="numeric">
+      <label class="small muted">Nouveaux mots par jour</label><select id="np">${[5,8,10,15,20].map(n=>`<option ${n==S.settings.newPerDay?"selected":""}>${n}</option>`).join("")}</select>
+    </div>
+    <div class="card stack" style="margin-top:12px"><h3>Voix</h3>
+      ${vs.length?`<select id="vc">${vs.map(v=>`<option value="${esc(v.name)}" ${v.name===S.settings.voice?"selected":""}>${esc(v.name)} (${v.lang})</option>`).join("")}</select>`:`<p class="small muted">Aucune voix française détectée. Sur iPhone : Réglages › Accessibilité › Contenu énoncé › Voix › Français, et téléchargez une voix « améliorée ».</p>`}
+      <label class="small muted">Vitesse : <span id="rv">${S.settings.rate}</span></label><input type="range" id="rt" min="0.6" max="1.2" step="0.05" value="${S.settings.rate}" style="width:100%">
+      <button class="btn soft" data-say="Bonjour ! Je suis votre professeur de français. On commence ?">🔊 Tester la voix</button>
+      <p class="small muted">Pas de son sur iPhone ? Désactivez le mode silencieux (interrupteur sur le côté).</p>
+      <label class="small muted">Accent pour la reconnaissance vocale</label>
+      <div class="seg" id="rl"><button data-v="fr-FR" class="${S.settings.recLang==="fr-FR"?"on":""}">France</button><button data-v="fr-CA" class="${S.settings.recLang==="fr-CA"?"on":""}">Canada</button></div>
+    </div>
+    <div class="card stack" style="margin-top:12px"><h3>Correction par l'IA</h3>
+      <p class="small muted">Sans clé, la correction s'ouvre dans l'app Claude (gratuit avec votre abonnement). Avec une clé API, elle est instantanée et l'IA joue l'examinateur en tâche 2 orale. La clé reste sur ce téléphone.</p>
+      <input type="password" id="ak" placeholder="sk-ant-…" value="${esc(S.settings.apiKey)}" autocomplete="off">
+      <select id="md">${["claude-sonnet-5-5","claude-haiku-5-5","claude-opus-5-5"].map(m=>`<option ${m===S.settings.model?"selected":""}>${m}</option>`).join("")}</select>
+      <label class="small muted">Langue des explications</label>
+      <div class="seg" id="fl"><button data-v="en" class="${S.settings.fbLang==="en"?"on":""}">English</button><button data-v="fr" class="${S.settings.fbLang==="fr"?"on":""}">Français</button></div>
+    </div>
+    <div class="card stack" style="margin-top:12px"><h3>Sauvegarde</h3>
+      <p class="small muted">Votre progression est stockée sur ce téléphone. Exportez-la de temps en temps.</p>
+      <div class="row"><button class="btn soft sm" id="ex">⬇ Exporter</button><label class="btn soft sm" style="margin:0">⬆ Importer<input type="file" id="im" accept="application/json,.json" hidden></label><button class="btn sm ghost" id="rs" style="color:var(--red)">Réinitialiser</button></div>
+    </div>
+    <div class="card stack" style="margin-top:12px"><h3>Installer l'app</h3>
+      <p class="small">iPhone : ouvrez ce site dans Safari › bouton Partager › <b>Sur l'écran d'accueil</b>.<br>Android : Chrome › menu ⋮ › <b>Installer l'application</b>.</p></div>
+    <p class="center small muted" style="margin-top:16px">Parlons v1.0 · ${VOCAB.length} mots · ${GRAMMAR.length} leçons · ${ORAL.length+ECRIT.length} documents</p>`);
+  $$("#lv button").forEach(b=>b.onclick=()=>{ S.level=b.dataset.l; save(); $$("#lv button").forEach(x=>x.classList.toggle("on",x===b)); toast("Niveau : "+S.level); });
+  $("#ed").onchange = e => { const v=e.target.value.trim(); if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) return toast("Format : 2027-03-15"); S.examDate=v; save(); toast("Date enregistrée"); };
+  $("#np").onchange = e => { S.settings.newPerDay=+e.target.value; save(); };
+  const vc=$("#vc"); if(vc) vc.onchange = e => { S.settings.voice=e.target.value; save(); TTS.speak("Voici ma voix."); };
+  $("#rt").oninput = e => { S.settings.rate=+e.target.value; $("#rv").textContent=S.settings.rate; save(); };
+  $$("#rl button").forEach(b=>b.onclick=()=>{ S.settings.recLang=b.dataset.v; save(); $$("#rl button").forEach(x=>x.classList.toggle("on",x===b)); });
+  $$("#fl button").forEach(b=>b.onclick=()=>{ S.settings.fbLang=b.dataset.v; save(); $$("#fl button").forEach(x=>x.classList.toggle("on",x===b)); });
+  $("#ak").onchange = e => { S.settings.apiKey=e.target.value.trim(); save(); toast(S.settings.apiKey?"Clé enregistrée":"Clé supprimée"); };
+  $("#md").onchange = e => { S.settings.model=e.target.value; save(); };
+  $("#ex").onclick = async () => {
+    const data = JSON.stringify({...S, settings:{...S.settings, apiKey:""}}, null, 1);
+    const file = new File([data], `parlons-${today()}.json`, {type:"application/json"});
+    if (navigator.canShare && navigator.canShare({files:[file]})) { try { await navigator.share({files:[file], title:"Sauvegarde Parlons"}); return; } catch(e){ if (e.name==="AbortError") return; } }
+    const a=document.createElement("a"); a.href=URL.createObjectURL(file); a.download=file.name; a.click();
+  };
+  $("#im").onchange = e => { const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ try{ const d=JSON.parse(r.result); if(!d.srs) throw 0; const key=S.settings.apiKey; S=Object.assign(structuredClone(DEFAULT), d); S.settings=Object.assign(structuredClone(DEFAULT.settings), d.settings||{}, {apiKey:key}); save(); toast("Progression importée"); route(); }catch(err){ toast("Fichier invalide"); } }; r.readAsText(f); };
+  $("#rs").onclick = () => { if (confirm("Effacer toute votre progression ? Cette action est définitive.")) { localStorage.removeItem(LKEY); location.hash="#/onboard"; location.reload(); } };
+};
+
+/* ---------------- Boot ---------------- */
+if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(()=>{}));
+route();
+})();
