@@ -106,3 +106,28 @@ details summary{cursor:pointer;font-weight:600;padding:4px 0}
 .kbd-hint{font-size:12px;color:var(--muted);margin-top:6px}
 hr{border:none;border-top:1px solid var(--line);margin:16px 0}
 .confetti{font-size:56px;text-align:center;margin:10px 0}
+
+/* Votre quartier */
+.city{padding:0;overflow:hidden;width:100%;text-align:left;font:inherit;color:inherit;cursor:pointer;display:block}
+.city svg{display:block;width:100%;height:auto}
+.city .pop{transform-box:fill-box;transform-origin:50% 100%;animation:grow 1.1s cubic-bezier(.2,1.5,.4,1) .3s both}
+@keyframes grow{from{transform:scale(.3,0);opacity:0}to{transform:none;opacity:1}}
+.city .cloud{animation:drift 60s linear infinite}
+@keyframes drift{from{transform:translateX(-40px)}to{transform:translateX(400px)}}
+.city .boat{animation:sail 38s ease-in-out infinite alternate}
+@keyframes sail{from{transform:translateX(4px)}to{transform:translateX(150px)}}
+.city .walker{animation:walk 30s linear infinite}
+@keyframes walk{from{transform:translateX(-10px)}to{transform:translateX(370px)}}
+.city .leg1{animation:step .5s ease-in-out infinite alternate}
+.city .leg2{animation:step .5s ease-in-out infinite alternate-reverse}
+@keyframes step{from{transform:skewX(-25deg)}to{transform:skewX(25deg)}}
+.city .leg1,.city .leg2{transform-box:fill-box;transform-origin:50% 0}
+.city .balloon{animation:float 5s ease-in-out infinite alternate}
+@keyframes float{from{transform:translateY(0)}to{transform:translateY(-9px)}}
+.city .fw{transform-box:fill-box;transform-origin:center;animation:burst 2.4s ease-out infinite}
+@keyframes burst{0%{transform:scale(.1);opacity:0}15%{opacity:1}70%{transform:scale(1);opacity:1}100%{transform:scale(1.1);opacity:0}}
+.city .tw{animation:twinkle 2.2s ease-in-out infinite alternate}
+@keyframes twinkle{from{opacity:.25}to{opacity:1}}
+.city .jet{animation:jet 1.2s ease-in-out infinite alternate}
+@keyframes jet{from{opacity:.55}to{opacity:1}}
+@media (prefers-reduced-motion:reduce){.city *{animation:none!important}}

@@ -24,7 +24,10 @@ const save = () => { try { localStorage.setItem(LKEY, JSON.stringify(S)); } catc
 
 function addXP(n){
   const d = today();
-  S.xp += n; S.days[d] = (S.days[d]||0) + n;
+  const before = cityStage(S.xp);
+  S.xp += n;
+  const after = cityStage(S.xp);
+  if (after > before) setTimeout(() => toast(`${CITY[after].emoji} Nouveau dans votre quartier : ${CITY[after].name} !`, 3400), 600); S.days[d] = (S.days[d]||0) + n;
   if (S.lastDay !== d){
     const y = new Date(Date.now()-DAY); const yd = y.getFullYear()+"-"+String(y.getMonth()+1).padStart(2,"0")+"-"+String(y.getDate()).padStart(2,"0");
     S.streak = (S.lastDay === yd) ? S.streak+1 : 1; S.lastDay = d; S.best = Math.max(S.best, S.streak);
@@ -334,7 +337,8 @@ VIEWS.home = () => {
     <div><div class="muted small">${hello} 👋</div><h1>Parlons</h1></div>
     <div class="row"><span class="pill red">🔥 ${S.streak}</span><span class="pill">⭐ ${S.xp}</span></div>
   </div>
-  <div class="card hero stack">
+  ${cityCard()}
+  <div class="card hero stack" style="margin-top:12px">
     <div class="row between"><span class="pill" style="background:rgba(255,255,255,.15);color:#fff">Niveau ${S.level}</span>${days!==null&&days>=0?`<span class="small muted">TCF dans ${days} j</span>`:""}</div>
     <h2 style="color:#fff">Séance du jour</h2>
     <div class="bar" style="background:rgba(255,255,255,.18)"><i style="width:${done/4*100}%;background:#fff"></i></div>
@@ -768,6 +772,37 @@ function runExam(){
   startPart();
 }
 
+/* ----- Votre quartier ----- */
+const isNight = () => { const h = new Date().getHours(); return h < 7 || h >= 19; };
+function cityCard(){
+  const st = cityStage(S.xp);
+  const seen = S.citySeen === undefined ? st : S.citySeen;
+  const fresh = st > seen ? st : -1;
+  S.citySeen = st; save();
+  const next = CITY[st+1];
+  const pct = next ? Math.round((S.xp - CITY[st].xp) / (next.xp - CITY[st].xp) * 100) : 100;
+  return `${fresh >= 0 ? `<div class="feedback ok center" style="margin:0 0 10px">🎉 Nouveau : <b>${esc(CITY[st].name)}</b> ${CITY[st].emoji}</div>` : ""}
+  <button class="card city" data-go="#/ville">
+    ${citySVG(st, {night:isNight(), fresh, flag:S.streak>=3})}
+    <div style="padding:12px 14px 14px">
+      <div class="row between"><b style="font-family:var(--serif);font-size:17px">Votre quartier</b><span class="pill gray">${st+1}/${CITY.length}</span></div>
+      <div class="bar" style="margin-top:8px"><i style="width:${pct}%"></i></div>
+      <div class="small muted" style="margin-top:6px">${next ? `${next.xp - S.xp} XP avant : ${next.emoji} ${esc(next.name)}` : "Quartier terminé. Magnifique !"}</div>
+    </div>
+  </button>`;
+}
+VIEWS.ville = () => {
+  const st = cityStage(S.xp);
+  html(`${top("Votre quartier")}
+    <div class="card city" style="cursor:default">${citySVG(st, {night:isNight(), flag:S.streak>=3})}</div>
+    <p class="muted" style="margin:12px 2px">Chaque XP gagné construit votre quartier parisien. Révisez, écoutez, écrivez, parlez : la ville grandit avec votre français.${S.streak>=3?" Le drapeau flotte tant que votre série dépasse 3 jours.":" Gardez une série de 3 jours pour hisser le drapeau."}</p>
+    ${CITY.map((c,i)=>{ const done = i<=st; return `<div class="list-item" style="cursor:default;${done?"":"opacity:.55"}">
+      <span style="font-size:24px;${done?"":"filter:grayscale(1)"}">${done?c.emoji:"🔒"}</span>
+      <span class="grow"><span class="t">${esc(c.name)}</span><br><span class="s">${done?esc(c.desc):c.xp+" XP"}</span></span>
+      ${done?'<span class="check done">✓</span>':`<span class="pill gray">${c.xp-S.xp} XP</span>`}</div>`; }).join("")}
+    <div class="card small" style="margin-top:12px"><b>Comment gagner de l'XP</b><br>Carte de vocabulaire +2 · Quiz de grammaire jusqu'à +10 · Document compris jusqu'à +12 · Séance du jour complète +20 · Tâche écrite ou orale +30 · Examen blanc +50</div>`);
+};
+
 /* ----- Progress ----- */
 VIEWS.progress = () => {
   const last14 = [...Array(14)].map((_,k)=>{ const d=new Date(Date.now()-(13-k)*DAY); const key=d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0"); return {d, xp:S.days[key]||0}; });
@@ -776,6 +811,7 @@ VIEWS.progress = () => {
   html(`${top("Progrès")}
     <div class="card"><div class="grid2" style="grid-template-columns:repeat(3,1fr)">
       <div class="stat"><b>🔥 ${S.streak}</b><span>jours de suite</span></div><div class="stat"><b>${S.xp}</b><span>XP total</span></div><div class="stat"><b>${mastered()}</b><span>mots maîtrisés</span></div></div></div>
+    <button class="list-item" data-go="#/ville"><span style="font-size:24px">${CITY[cityStage(S.xp)].emoji}</span><span class="grow"><span class="t">Votre quartier</span><br><span class="s">Étape ${cityStage(S.xp)+1}/${CITY.length} · ${esc(CITY[cityStage(S.xp)].name)}</span></span>›</button>
     <div class="card" style="margin-top:12px"><h3>14 derniers jours</h3>
       <div style="display:flex;align-items:flex-end;gap:5px;height:90px;margin-top:12px">${last14.map(x=>`<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px"><div style="width:100%;height:${Math.max(3,x.xp/mx*70)}px;background:${x.xp?"var(--blue)":"var(--line)"};border-radius:5px"></div><span style="font-size:10px" class="muted">${x.d.getDate()}</span></div>`).join("")}</div></div>
     <div class="card" style="margin-top:12px"><h3>Niveaux</h3>${LEVELS.map(l=>`<div style="margin-top:12px"><div class="row between"><b>${l}</b><span class="small muted">${levelProgress(l)} %</span></div><div class="bar green" style="margin-top:6px"><i style="width:${levelProgress(l)}%"></i></div></div>`).join("")}</div>
