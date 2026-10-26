@@ -1,7 +1,7 @@
 // Network-first for the app's own files (so updates show up immediately), cache fallback when offline.
-const CACHE = "parlons-v2";
-const CORE = ["./", "index.html", "styles.css?v=2", "app.js?v=2", "city.js?v=2", "data/vocab.js?v=2", "data/grammar.js?v=2",
-  "data/comprehension.js?v=2", "data/production.js?v=2", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
+const CACHE = "parlons-v3";
+const CORE = ["./", "index.html", "styles.css?v=3", "app.js?v=3", "city.js?v=3", "data/vocab.js?v=3", "data/grammar.js?v=3",
+  "data/comprehension.js?v=3", "data/production.js?v=3", "data/vocab2.js?v=3", "data/grammar2.js?v=3", "data/oral2.js?v=3", "data/ecrit2.js?v=3", "data/production2.js?v=3", "data/conversations.js?v=3", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));

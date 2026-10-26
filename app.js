@@ -16,7 +16,7 @@ const upTo = l => LEVELS.slice(0, lvlIdx(l)+1);
 const DEFAULT = {v:1,onboarded:false,level:"A1",examDate:"",xp:0,streak:0,best:0,lastDay:"",days:{},
   srs:{},grammar:{},oral:{},ecrit:{},dictee:{n:0,sum:0},pron:{n:0,sum:0},writing:[],speaking:[],exams:[],
   daily:{date:"",steps:{}},
-  settings:{voice:"",rate:0.95,recLang:"fr-FR",apiKey:"",model:"claude-sonnet-5-5",fbLang:"en",newPerDay:8}};
+  settings:{voice:"",rate:0.95,recLang:"fr-FR",apiKey:"",model:"claude-sonnet-5-5",fbLang:"en",newPerDay:10,theme:"auto",transcript:true,autoSpeak:true}};
 let S;
 try { S = Object.assign(structuredClone(DEFAULT), JSON.parse(localStorage.getItem(LKEY)||"{}")); S.settings = Object.assign(structuredClone(DEFAULT.settings), S.settings||{}); }
 catch(e){ S = structuredClone(DEFAULT); }
@@ -43,71 +43,175 @@ const dailySteps = () => S.daily.date === today() ? S.daily.steps : {};
 
 function toast(msg, ms=2400){ const t=document.createElement("div"); t.className="toast"; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(), ms); }
 
+/* ---------------- Audio session (iOS) ---------------- */
+// iOS mutes web audio with the Silent switch unless the session is "playback"; the mic needs "play-and-record".
+const setAudioSession = t => { try { if (navigator.audioSession) navigator.audioSession.type = t; } catch(e){} };
+const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+
 /* ---------------- Text-to-speech ---------------- */
 const TTS = {
-  voices:[], speaking:false,
-  load(){ const v = speechSynthesis.getVoices().filter(v=>/^fr/i.test(v.lang)); if (v.length) this.voices = v; return this.voices; },
+  voices:[], speaking:false, utts:[], gen:0, check:null,
+  load(){ try { const v = speechSynthesis.getVoices().filter(v=>/^fr/i.test(v.lang)); if (v.length) this.voices = v; } catch(e){} return this.voices; },
   voice(i=0){ const vs=this.load(); if(!vs.length) return null;
-    const pref = vs.find(v=>v.name===S.settings.voice) || vs.find(v=>/fr-FR/i.test(v.lang)&&/(Amélie|Audrey|Thomas|Google|Denise|Marie)/i.test(v.name)) || vs.find(v=>/fr-FR/i.test(v.lang)) || vs[0];
+    const rank = v => (v.name===S.settings.voice?10:0) + (/premium/i.test(v.name)?3:/enhanced|amélioré/i.test(v.name)?2:0) + (/fr-FR/i.test(v.lang)?1:0) + (/(Amélie|Audrey|Thomas|Google|Denise|Marie)/i.test(v.name)?.5:0);
+    const sorted = vs.slice().sort((a,b)=>rank(b)-rank(a)); const pref = sorted[0];
     if (i===0) return pref;
-    const other = vs.find(v=>v!==pref && v.lang===pref.lang) || vs.find(v=>v!==pref);
-    return other || pref; },
-  stop(){ speechSynthesis.cancel(); this.speaking=false; $$(".speak.playing").forEach(b=>b.classList.remove("playing")); },
+    return sorted.find(v=>v!==pref && v.lang===pref.lang) || sorted.find(v=>v!==pref) || pref; },
+  stop(){ this.gen++; this.speaking=false; this.utts=[]; clearTimeout(this.check); try { speechSynthesis.cancel(); } catch(e){} $$(".playing").forEach(b=>b.classList.remove("playing")); },
   speak(text, opts={}){
-    if (!("speechSynthesis" in window)) { toast("La synthèse vocale n'est pas disponible sur cet appareil."); return; }
-    this.stop();
-    const rate = (opts.rate ?? S.settings.rate);
-    const lines = String(text).split("\n").filter(Boolean);
+    if (!("speechSynthesis" in window)) { toast("La synthèse vocale n'est pas disponible sur cet appareil."); opts.onend && opts.onend(); return; }
+    if (Mic.on) Mic.stop();
+    this.stop(); setAudioSession("playback");
+    const gen = this.gen, rate = (opts.rate ?? S.settings.rate);
     const queue = [];
-    for (const raw of lines){
-      let who = 0, line = raw;
-      const m = raw.match(/^([AB]):\s*(.*)$/); if (m){ who = m[1]==="A"?0:1; line = m[2]; }
+    for (const raw of String(text).split("\n").filter(Boolean)){
+      let who = 0, line = raw; const m = raw.match(/^([AB]):\s*(.*)$/); if (m){ who = m[1]==="A"?0:1; line = m[2]; }
       for (const part of line.split(/(?<=[.!?…;])\s+/)) if (part.trim()) queue.push({who, part:part.replace(/…/g,"...")});
     }
-    if (!queue.length) return;
+    if (!queue.length){ opts.onend && opts.onend(); return; }
     this.speaking = true; opts.btn && opts.btn.classList.add("playing");
-    let i = 0;
+    let i = 0, started = false;
+    const finish = () => { if (gen!==this.gen) return; this.speaking=false; clearTimeout(this.check); opts.btn && opts.btn.classList.remove("playing"); opts.onend && opts.onend(); };
     const next = () => {
-      if (!this.speaking) return;
-      if (i >= queue.length){ this.speaking=false; opts.btn && opts.btn.classList.remove("playing"); opts.onend && opts.onend(); return; }
+      if (gen!==this.gen) return;
+      if (i >= queue.length) return finish();
       const {who, part} = queue[i++];
       const u = new SpeechSynthesisUtterance(part);
+      this.utts.push(u); // keep a reference: iOS drops utterances that get garbage-collected (onend never fires)
       const v = this.voice(who); if (v){ u.voice = v; u.lang = v.lang; } else u.lang = "fr-FR";
-      u.rate = rate; u.pitch = (who===1 && this.voice(1)===this.voice(0)) ? 0.8 : 1;
-      u.onend = () => setTimeout(next, who!==(queue[i]?.who ?? who) ? 350 : 120);
-      u.onerror = () => { this.speaking=false; opts.btn && opts.btn.classList.remove("playing"); };
-      speechSynthesis.speak(u);
+      u.rate = rate; u.volume = 1; u.pitch = (who===1 && this.voice(1)===this.voice(0)) ? 0.8 : 1;
+      u.onstart = () => { started = true; };
+      u.onend = () => setTimeout(next, who!==(queue[i]?.who ?? who) ? 350 : 100);
+      u.onerror = e => { if (e && (e.error==="interrupted"||e.error==="canceled")) return; setTimeout(next, 50); };
+      speechSynthesis.speak(u); try { speechSynthesis.resume(); } catch(e){}
     };
     next();
+    this.check = setTimeout(() => { if (gen===this.gen && !started && !speechSynthesis.speaking){ finish(); toast("Pas de son ? Montez le volume ou désactivez le mode silencieux, puis réessayez."); } }, 2500);
   }
 };
 if ("speechSynthesis" in window){ TTS.load(); speechSynthesis.onvoiceschanged = () => TTS.load(); }
+// iOS only lets speech start from a tap. Prime it on the first tap so replies fetched later (AI conversation) can be spoken.
+(function unlockSpeech(){
+  const go = () => { try { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } catch(e){}
+    document.removeEventListener("touchend", go, true); document.removeEventListener("click", go, true); };
+  document.addEventListener("touchend", go, true); document.addEventListener("click", go, true);
+})();
 const speakBtn = (text, extra="") => `<button class="speak" data-say="${esc(text)}" ${extra} aria-label="Écouter">🔊</button>`;
 
-/* ---------------- Speech recognition ---------------- */
+/* ---------------- Microphone (ported from Intersection's fixes) ----------------
+   1. Open the mic with getUserMedia first (switching iOS to play-and-record) and always record audio,
+      so there is a playback even when speech recognition fails.
+   2. Restart recognition gently: at most 6 times, never faster than every 1.5 s (a tight restart loop is
+      what made the Stop button unresponsive).
+   3. Stopping keeps the unfinished (interim) words, which iOS often never finalises.
+   4. A dedicated red Stop button, a double-tap guard and a hard time cap.                                   */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-function makeRecognizer({continuous=true, onText, onEnd}){
-  if (!SR) return null;
-  let rec, active=false, finalText="", restarts=0, lastStart=0;
-  const start = () => {
-    rec = new SR(); rec.lang = S.settings.recLang; rec.continuous = continuous; rec.interimResults = true; rec.maxAlternatives = 1;
-    rec.onresult = e => {
-      let interim = "";
-      for (let i=e.resultIndex;i<e.results.length;i++){ const r=e.results[i]; if (r.isFinal) finalText += (finalText?" ":"") + r[0].transcript.trim(); else interim += r[0].transcript; }
-      onText && onText(finalText, interim);
-    };
-    rec.onerror = e => { if (e.error==="not-allowed"||e.error==="service-not-allowed"){ active=false; toast("Micro refusé. Autorisez le micro dans les réglages du navigateur."); } };
-    rec.onend = () => {
-      if (active && continuous && restarts < 40){ const wait = Math.max(0, 500-(Date.now()-lastStart)); restarts++; setTimeout(()=>{ if(active){ lastStart=Date.now(); try{rec.start();}catch(e){} } }, wait); }
-      else { active=false; onEnd && onEnd(finalText); }
-    };
-    lastStart = Date.now(); rec.start();
+const Mic = {
+  on:false, busy:false, stream:null, mr:null, chunks:[], url:null, recog:null, final:"", interim:"", t0:0, secs:0,
+  restarts:0, lastRestart:0, timer:null, cap:null, silence:null, ctx:null, raf:0, opts:{}, heard:false,
+  get text(){ return (this.final+" "+this.interim).replace(/\s+/g," ").trim(); },
+  async start(opts={}){
+    if (this.on || this.busy) return false;
+    this.busy = true; TTS.stop(); this.opts = opts; this.final=""; this.interim=""; this.secs=0; this.chunks=[]; this.heard=false;
+    if (this.url){ try { URL.revokeObjectURL(this.url); } catch(e){} this.url=null; }
+    try { setAudioSession("play-and-record"); this.stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}}); }
+    catch(e){ this.busy=false; setAudioSession("playback"); toast("Micro bloqué. Autorisez-le dans Réglages › Safari › Microphone, ou écrivez votre réponse.", 4000); return false; }
+    try {
+      const has = t => window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t);
+      const mime = has("audio/mp4") ? "audio/mp4" : has("audio/webm") ? "audio/webm" : "";
+      const mr = new MediaRecorder(this.stream, mime ? {mimeType:mime} : undefined); this.mr = mr; const chunks = this.chunks;
+      mr.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+      mr.onstop = () => { if (chunks.length){ this.url = URL.createObjectURL(new Blob(chunks, {type: mr.mimeType || "audio/mp4"})); } opts.onAudio && opts.onAudio(this.url); };
+      mr.start(250);
+    } catch(e){ this.mr = null; }
+    try { // live level meter, so you can see the mic hears you
+      const AC = window.AudioContext || window.webkitAudioContext; this.ctx = new AC();
+      if (this.ctx.state === "suspended") this.ctx.resume().catch(()=>{});
+      const an = this.ctx.createAnalyser(); an.fftSize = 512; this.ctx.createMediaStreamSource(this.stream).connect(an);
+      const buf = new Uint8Array(an.fftSize);
+      const tick = () => { if (!this.on && !this.busy) return; an.getByteTimeDomainData(buf); let s=0; for (const v of buf){ const d=(v-128)/128; s+=d*d; }
+        const lvl = Math.min(1, Math.sqrt(s/buf.length)*5); if (lvl > .12) this.heard = true; opts.onLevel && opts.onLevel(lvl); this.raf = requestAnimationFrame(tick); };
+      this.raf = requestAnimationFrame(tick);
+    } catch(e){ this.ctx = null; }
+    if (SR && S.settings.transcript !== false){
+      try {
+        const r = new SR(); this.recog = r;
+        r.lang = S.settings.recLang; r.continuous = true; r.interimResults = true; r.maxAlternatives = 1;
+        r.onresult = ev => {
+          if (this.recog !== r) return;
+          let interim = "";
+          for (let i=ev.resultIndex;i<ev.results.length;i++){ const res = ev.results[i]; if (res.isFinal) this.final += res[0].transcript.trim()+" "; else interim += res[0].transcript; }
+          this.interim = interim; opts.onText && opts.onText(this.text);
+          if (opts.autoStop && this.text){ clearTimeout(this.silence); this.silence = setTimeout(() => { if (this.on) this.finish(); }, opts.autoStop); }
+        };
+        r.onerror = () => {};
+        r.onend = () => {
+          if (!this.on || this.recog !== r) return;
+          if (this.interim){ this.final += this.interim+" "; this.interim=""; }
+          const now = Date.now(); if (this.restarts >= 6 || now - this.lastRestart < 1500) return;
+          this.restarts++; this.lastRestart = now;
+          setTimeout(() => { if (this.on && this.recog === r){ try { r.start(); } catch(e){} } }, 300);
+        };
+        r.start();
+      } catch(e){ this.recog = null; }
+    }
+    this.on = true; this.busy = false; this.t0 = Date.now(); this.restarts = 0; this.lastRestart = Date.now();
+    clearTimeout(this.cap); this.cap = setTimeout(() => { if (this.on) this.finish(); }, (opts.maxSecs || 180)*1000);
+    this.timer = setInterval(() => { this.secs = Math.round((Date.now()-this.t0)/1000); opts.onTick && opts.onTick(this.secs); }, 250);
+    return true;
+  },
+  stop(){
+    if (!this.on) return this.text;
+    this.on = false; clearInterval(this.timer); clearTimeout(this.cap); clearTimeout(this.silence); cancelAnimationFrame(this.raf);
+    this.secs = Math.max(1, Math.round((Date.now()-this.t0)/1000));
+    const text = this.text;
+    try { this.mr && this.mr.state !== "inactive" && this.mr.stop(); } catch(e){}
+    const r = this.recog; this.recog = null;
+    try { r && r.stop(); } catch(e){}
+    setTimeout(() => { try { r && r.abort && r.abort(); } catch(e){} }, 800);
+    const st = this.stream; this.stream = null;
+    setTimeout(() => { try { st && st.getTracks().forEach(t=>t.stop()); } catch(e){} setAudioSession("playback"); }, 300);
+    try { this.ctx && this.ctx.close(); } catch(e){} this.ctx = null;
+    return text;
+  },
+  finish(){ const t = this.stop(); const cb = this.opts.onStop; this.opts.onStop = null; cb && cb(t, this.secs, this.heard); }
+};
+
+window.Mic = Mic; // handy for debugging from the console
+
+// Reusable recorder widget: big mic toggle, level meter, timer, live transcript, a separate red Stop button, playback.
+function recorder(el, {autoStop=0, maxSecs=180, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive, compact=false}={}){
+  el.innerHTML = `<div class="rec ${compact?"compact":""}">
+    <button class="mic" type="button" aria-label="Enregistrer">🎤</button>
+    <div class="level" aria-hidden="true"><i></i></div>
+    <div class="row" style="justify-content:center;gap:8px"><span class="timer rt">0:00</span><span class="small muted rh">${hint}</span></div>
+    <div class="transcript rx" hidden></div>
+    <button class="btn red rs" type="button" hidden>■ Arrêter l'enregistrement</button>
+    <audio class="rp" controls hidden></audio></div>`;
+  const q = s => el.querySelector(s);
+  const mic=q(".mic"), lvl=q(".level i"), rt=q(".rt"), rh=q(".rh"), rx=q(".rx"), rs=q(".rs"), rp=q(".rp");
+  const idle = () => { mic.classList.remove("on"); mic.textContent="🎤"; mic.setAttribute("aria-label","Enregistrer"); rs.hidden=true; lvl.style.width="0"; };
+  const stopNow = () => { if (Mic.on) Mic.finish(); };
+  mic.onclick = async () => {
+    if (Mic.busy) return;
+    if (Mic.on) return stopNow();
+    rp.hidden = true; rx.hidden = compact; rx.textContent = SR && S.settings.transcript!==false ? "J'écoute…" : "Enregistrement en cours (transcription désactivée)";
+    const ok = await Mic.start({autoStop, maxSecs,
+      onText: t => { rx.textContent = t || "J'écoute…"; onLive && onLive(t); },
+      onLevel: v => { lvl.style.width = Math.round(v*100)+"%"; },
+      onTick: s => { rt.textContent = fmt(s); },
+      onAudio: url => { if (url && !compact){ rp.src = url; rp.hidden = false; } },
+      onStop: (text, secs, heard) => { idle(); rh.textContent = "Appuyez sur le micro pour recommencer";
+        if (!text && !compact) rx.textContent = heard ? "Je vous ai entendu, mais la transcription n'a pas fonctionné. Réécoutez-vous ci-dessous." : "Aucun son capté. Vérifiez que le micro est autorisé et parlez plus près.";
+        onStop && onStop(text, secs, heard); }});
+    if (!ok){ rx.hidden = true; return; }
+    mic.classList.add("on"); mic.textContent="■"; mic.setAttribute("aria-label","Arrêter"); rs.hidden = compact;
+    rh.textContent = autoStop ? "Parlez… ça s'arrête tout seul après une pause" : "Parlez… puis appuyez sur ■";
+    onStart && onStart();
   };
-  return {
-    start(){ finalText=""; restarts=0; active=true; try{ start(); }catch(e){ active=false; toast("Impossible de démarrer le micro."); } },
-    stop(){ active=false; try{ rec && rec.stop(); }catch(e){} },
-    get text(){ return finalText; }, get active(){ return active; }
-  };
+  rs.onclick = stopNow;
+  onLeave(() => { if (Mic.on) Mic.stop(); });
+  return {stop: stopNow, get playback(){ return rp; }};
 }
 
 /* ---------------- Text comparison ---------------- */
@@ -356,7 +460,8 @@ VIEWS.home = () => {
     ${tile("#/write","📝","Expression écrite","Tâches 1, 2, 3")}
     ${tile("#/speak","🎙️","Expression orale","Tâches 1, 2, 3")}
   </div>
-  <button class="list-item" data-go="#/exam" style="margin-top:12px"><span style="font-size:24px">⏱️</span><span class="grow"><span class="t">Examen blanc</span><br><span class="s">Compréhension orale + écrite chronométrées, score /699 et NCLC estimés</span></span>›</button>
+  <button class="list-item" data-go="#/talk" style="margin-top:12px"><span style="font-size:24px">💬</span><span class="grow"><span class="t">Conversation avec l'IA</span><br><span class="s">${CONVOS.length} scénarios : café, entretien, débats… Parlez ou écrivez, l'IA corrige.</span></span>›</button>
+  <button class="list-item" data-go="#/exam"><span style="font-size:24px">⏱️</span><span class="grow"><span class="t">Examen blanc</span><br><span class="s">Compréhension orale + écrite chronométrées, score /699 et NCLC estimés</span></span>›</button>
   <div class="card" style="margin-top:12px">
     <div class="row between"><h3>Progression ${S.level}</h3><span class="pill gray">${levelProgress(S.level)} %</span></div>
     <div class="bar green" style="margin-top:10px"><i style="width:${levelProgress(S.level)}%"></i></div>
@@ -388,8 +493,11 @@ VIEWS.vocab = () => {
   html(`${top("Vocabulaire", "#/home", `<button class="btn sm ghost" data-go="#/words">Liste</button>`)}<div id="vz"></div>`);
   const box = $("#vz");
   if (!q.length){
-    box.innerHTML = `<div class="card center stack"><div class="confetti">✅</div><h2>Tout est révisé</h2><p class="muted">Revenez demain pour de nouvelles cartes, ou entraînez-vous librement.</p>
-      <button class="btn" id="extra">10 cartes au hasard</button></div>`;
+    const fresh = vocabPool().filter(w=>!S.srs[wordId(w)]);
+    box.innerHTML = `<div class="card center stack"><div class="confetti">✅</div><h2>Tout est révisé</h2><p class="muted">Vos révisions du jour sont faites. Envie de continuer ?</p>
+      ${fresh.length?`<button class="btn" id="more">Apprendre 10 nouveaux mots</button>`:""}<button class="btn ghost" id="extra">10 cartes au hasard</button>
+      <p class="small muted">${fresh.length} mots encore à découvrir jusqu'au niveau ${S.level}.</p></div>`;
+    const mb = $("#more"); if (mb) mb.onclick = () => run(fresh.slice(0,10), false);
     $("#extra").onclick = () => run(shuffle(vocabPool()).slice(0,10), true); return;
   }
   run(q, false);
@@ -400,7 +508,7 @@ VIEWS.vocab = () => {
       if (i>=queue.length){
         addXP(total*2); if (total>=5) markDaily("vocab");
         box.innerHTML = `<div class="card center stack"><div class="confetti">🎉</div><h2>Session terminée</h2><p class="muted">${right}/${total} du premier coup · +${total*2} XP</p>
-          <p class="small muted">${mastered()} mots maîtrisés · ${learned()} mots vus</p><button class="btn" data-go="#/home">Retour</button></div>`; return;
+          <p class="small muted">${mastered()} mots maîtrisés · ${learned()} mots vus</p><button class="btn" data-go="#/home">Retour</button><button class="btn ghost" data-go="#/vocab">Continuer</button></div>`; return;
       }
       const w = queue[i++]; const c = S.srs[wordId(w)]; const box_ = c?.box||0;
       const mode = !c ? "learn" : box_<=1 ? "recog" : box_===2 ? "listen" : (Math.random()<.5?"produce":"listen");
@@ -460,12 +568,19 @@ VIEWS.words = () => {
 
 /* ----- Grammar ----- */
 VIEWS.grammar = (id) => {
+  if (id === "mix") return grammarMix();
   if (id) return grammarLesson(id);
-  html(`${top("Grammaire")}<p class="muted">Les structures testées au TCF. Réussissez le quiz à 80 % pour valider une leçon.</p>` +
+  html(`${top("Grammaire")}<p class="muted">Les structures testées au TCF. Réussissez le quiz à 80 % pour valider une leçon.</p>
+    <button class="list-item" data-go="#/grammar/mix"><span style="font-size:24px">🔀</span><span class="grow"><span class="t">Révision mixte</span><br><span class="s">10 questions tirées de toutes les leçons jusqu'au niveau ${S.level}</span></span>›</button>` +
     LEVELS.map(l=>`<h3 style="margin:18px 0 4px">${l} ${lvlIdx(l)>lvlIdx(S.level)?'<span class="pill gray">plus tard</span>':""}</h3>` +
     GRAMMAR.filter(g=>g.level===l).map(g=>{ const b=S.grammar[g.id]?.best; return `<button class="list-item" data-go="#/grammar/${g.id}">
       <span class="check ${b>=.8?"done":""}">${b>=.8?"✓":""}</span><span class="grow"><span class="t">${esc(g.title)}</span>${b!==undefined?`<br><span class="s">Meilleur score : ${Math.round(b*100)} %</span>`:""}</span>›</button>`; }).join("")).join(""));
 };
+function grammarMix(){
+  const pool = shuffle(GRAMMAR.filter(g=>upTo(S.level).includes(g.level)).flatMap(g=>g.quiz.map(q=>({q:q[0],opts:q[1],ans:q[2],why:q[3]+" ("+g.title+")"})))).slice(0,10);
+  html(`${top("Révision mixte", "#/grammar")}<p class="muted">Dix questions au hasard. Recommencez autant que vous voulez : le tirage change à chaque fois.</p><div id="qz"></div>`);
+  quiz($("#qz"), pool, score => { addXP(Math.round(score*12)); markDaily("grammar"); });
+}
 function grammarLesson(id){
   const g = GRAMMAR.find(x=>x.id===id); if (!g) return VIEWS.grammar();
   html(`${top(esc(g.title), "#/grammar", `<span class="pill">${g.level}</span>`)}
@@ -500,15 +615,41 @@ function quiz(el, items, onDone, {shuffleOpts=true, audio=false}={}){
 }
 
 /* ----- Comprehension (oral + écrit) ----- */
+// Shuffle answer options each time so the correct answer isn't always in the same position
+const shuffleDoc = x => ({...x, questions: x.questions.map(q => { const order = shuffle(q[1].map((_,k)=>k)); return [q[0], order.map(k=>q[1][k]), order.indexOf(q[2])]; })});
 function compList(kind){
   const data = kind==="oral"?ORAL:ECRIT, store = S[kind];
+  const left = data.filter(x=>upTo(S.level).includes(x.level) && store[x.id]===undefined).length;
   html(`${top(kind==="oral"?"Compréhension orale":"Compréhension écrite")}
-    <p class="muted">${kind==="oral"?"Au TCF, chaque document n'est entendu qu'une fois : essayez d'abord sans réécouter.":"Lisez le document, puis répondez. Au TCF : 39 questions en 60 minutes."}</p>` +
+    <p class="muted">${kind==="oral"?"Au TCF, chaque document n'est entendu qu'une fois : essayez d'abord sans réécouter.":"Lisez le document, puis répondez. Au TCF : 39 questions en 60 minutes."} ${left} documents pas encore faits jusqu'au niveau ${S.level}.</p>
+    ${S.settings.apiKey ? `<button class="btn soft" id="gen">✨ Nouveau document ${S.level} créé par l'IA</button>` : `<p class="small muted">Astuce : avec une clé API (Réglages), l'IA crée des documents illimités à votre niveau.</p>`}` +
     LEVELS.map(l=>`<h3 style="margin:18px 0 4px">${l}</h3>`+data.filter(x=>x.level===l).map(x=>{ const s=store[x.id];
-      return `<button class="list-item" data-go="#/${kind}/${x.id}"><span class="check ${s>=.5?"done":""}">${s>=.5?"✓":""}</span><span class="grow"><span class="t">${esc(x.context)}</span><br><span class="s">${x.questions.length} questions${s!==undefined?` · ${Math.round(s*100)} %`:""}</span></span>›</button>`; }).join("")).join(""));
+      return `<button class="list-item" data-go="#/${kind}/${x.id}"><span class="check ${s>=.5?"done":""}">${s>=.5?"✓":""}</span><span class="grow"><span class="t">${x.gen?"✨ ":""}${esc(x.context)}</span><br><span class="s">${x.questions.length} questions${s!==undefined?` · ${Math.round(s*100)} %`:""}</span></span>›</button>`; }).join("")).join(""));
+  const g = $("#gen"); if (g) g.onclick = () => generateDoc(kind, g);
+}
+async function generateDoc(kind, btn){
+  btn.disabled = true; btn.textContent = "L'IA écrit un document…";
+  const data = kind==="oral"?ORAL:ECRIT;
+  const recent = shuffle(data.map(d=>d.context)).slice(0,12).join(", ");
+  const len = {A1:"40 to 60",A2:"60 to 90",B1:"100 to 140",B2:"140 to 190"}[S.level];
+  const prompt = `Create one ORIGINAL TCF Canada ${kind==="oral"?"listening (compréhension orale) item, written as it would be heard":"reading (compréhension écrite) item"} at CEFR level ${S.level}.
+Use a Canadian or Québec everyday, professional or societal context. Pick a different document type and topic from these existing ones: ${recent}.
+Return ONLY valid JSON, nothing else:
+{"context":"short French label of the document type (e.g. Message vocal, Annonce, Article de presse, Dialogue au travail)","text":"the document in French, ${len} words${kind==="oral"?". For a dialogue, put each line on its own line starting with \"A: \" or \"B: \"":". Use \\n for line breaks if needed"}","questions":[["question in French",["option 1","option 2","option 3","option 4"],0]]}
+Write exactly 3 questions testing understanding (main idea, a detail, an inference${S.level==="B2"?" or the author's opinion":""}). Options are short, plausible, in French, with exactly one correct; vary the position of the correct answer (index 0-3).`;
+  try {
+    const raw = await callClaude("You write accurate, natural French exam material for TCF Canada preparation.", [{role:"user", content:prompt}], 1500);
+    const o = JSON.parse(raw.match(/\{[\s\S]*\}/)[0]);
+    if (!o.text || !Array.isArray(o.questions) || !o.questions.length) throw new Error("format");
+    o.questions = o.questions.filter(q => Array.isArray(q[1]) && q[1].length>=2 && q[2]>=0 && q[2]<q[1].length);
+    const item = {id:"gen-"+kind+"-"+Date.now().toString(36), level:S.level, context:o.context||"Document", text:o.text, questions:o.questions, gen:true};
+    S.gen = S.gen || {oral:[], ecrit:[]}; S.gen[kind].push(item); if (S.gen[kind].length>40) S.gen[kind].shift(); save();
+    data.push(item); location.hash = "#/"+kind+"/"+item.id;
+  } catch(e){ toast("Impossible de créer le document ("+(e.message||"erreur")+"). Réessayez.", 3500); btn.disabled = false; btn.textContent = "✨ Réessayer"; }
 }
 function compItem(kind, id){
-  const data = kind==="oral"?ORAL:ECRIT; const x = data.find(d=>d.id===id); if(!x) return compList(kind);
+  const data = kind==="oral"?ORAL:ECRIT; const x0 = data.find(d=>d.id===id); if(!x0) return compList(kind);
+  const x = shuffleDoc(x0);
   let plays = 0;
   html(`${top(esc(x.context), "#/"+kind, `<span class="pill">${x.level}</span>`)}
     ${kind==="oral" ? `<div class="card center stack">
@@ -572,40 +713,31 @@ VIEWS.dictee = () => {
 VIEWS.pron = () => {
   const pool = shuffle(SENTENCES.filter(s=>upTo(S.level).includes(s.level)));
   let i = 0, sessionDone = 0;
-  html(`${top("Prononciation")}<p class="muted">Écoutez le modèle, appuyez sur le micro et répétez. Les mots en vert ont été reconnus.</p><div id="pz"></div>`);
-  if (!SR){ $("#pz").innerHTML = `<div class="feedback ko">La reconnaissance vocale n'est pas disponible dans ce navigateur. Sur iPhone, utilisez Safari ; sur Android, Chrome. Vous pouvez quand même écouter et répéter.</div>`; }
-  let rec = null;
+  const record = score => { S.pron.n++; S.pron.sum += score; save(); addXP(Math.round(score/10)); sessionDone++; if (sessionDone>=3) markDaily("speak"); };
+  html(`${top("Prononciation")}<p class="muted">Écoutez le modèle, appuyez sur le micro et répétez. L'enregistrement s'arrête tout seul après une pause, ou appuyez sur ■.</p><div id="pz"></div>`);
   const show = () => {
     const s = pool[i % pool.length];
-    $("#pz").insertAdjacentHTML("beforeend","");
-    const box = document.createElement("div"); box.className="card stack center"; box.id="pcard";
-    box.innerHTML = `<div class="row between"><span class="pill">${s.level}</span><span class="pill gray">${esc(s.focus)}</span></div>
+    $("#pz").innerHTML = `<div class="card stack center">
+      <div class="row between"><span class="pill">${s.level}</span><span class="pill gray">${esc(s.focus)}</span></div>
       <p class="fr" style="font-size:22px">${esc(s.fr)}</p>
-      <div class="row" style="justify-content:center">${speakBtn(s.fr)}<button class="btn sm ghost" data-say="${esc(s.fr)}" data-rate="0.65">🐢</button></div>
-      ${SR?`<button class="mic" id="mic">🎤</button><div class="small muted" id="hint">Appuyez, parlez, puis appuyez à nouveau</div>`:""}
-      <div class="transcript" id="tx"></div><div id="res"></div>`;
-    const old = $("#pcard"); old ? old.replaceWith(box) : $("#pz").appendChild(box);
-    if (!SR) { box.insertAdjacentHTML("beforeend", `<button class="btn" id="nx">Suivante →</button>`); $("#nx").onclick=()=>{i++;show();}; return; }
-    const finish = (text) => {
-      $("#mic").classList.remove("on"); $("#mic").textContent="🎤";
-      if (!text.trim()) { $("#hint").textContent = "Rien entendu. Réessayez, plus près du micro."; return; }
+      <div class="row" style="justify-content:center">${speakBtn(s.fr)}<button class="btn sm ghost" data-say="${esc(s.fr)}" data-rate="0.65">🐢 Lentement</button></div>
+      <div id="rc"></div><div id="res"></div>
+      <button class="btn ghost" id="skip">Phrase suivante →</button></div>`;
+    $("#skip").onclick = () => { i++; show(); };
+    recorder($("#rc"), {autoStop:1800, maxSecs:25, onStop:(text) => {
+      if (!text){
+        $("#res").innerHTML = `<div class="feedback info">Réécoutez-vous et comparez au modèle, puis notez-vous :</div>
+          <div class="grid2" style="grid-template-columns:1fr 1fr 1fr;margin-top:8px"><button class="btn sm red" data-self="40">À revoir</button><button class="btn sm soft" data-self="70">Bien</button><button class="btn sm green" data-self="95">Parfait</button></div>`;
+        $$("#res [data-self]").forEach(b => b.onclick = () => { record(+b.dataset.self); $("#res").innerHTML = `<div class="feedback ok">Noté. Phrase suivante quand vous voulez.</div>`; });
+        return;
+      }
       const r = compare(s.fr, text, {accents:false});
-      $("#tx").innerHTML = renderTokens(r.tokens);
-      S.pron.n++; S.pron.sum += r.score; save(); addXP(Math.round(r.score/10)); sessionDone++; if (sessionDone>=3) markDaily("speak");
-      $("#res").innerHTML = `<div class="feedback ${r.score>=85?"ok":r.score>=60?"info":"ko"}"><b>${r.score} %</b> · ${r.score>=85?"Excellent !":r.score>=60?"Bien, encore un essai ?":"Écoutez le modèle lentement, puis réessayez."}</div>
-        <div class="row" style="margin-top:10px"><button class="btn ghost" id="retry">↻ Réessayer</button><button class="btn" id="nx">Suivante →</button></div>`;
-      $("#retry").onclick = () => { $("#res").innerHTML=""; $("#tx").innerHTML=""; $("#hint").textContent="Appuyez, parlez, puis appuyez à nouveau"; };
-      $("#nx").onclick = () => { i++; show(); };
-    };
-    $("#mic").onclick = () => {
-      if (rec && rec.active){ rec.stop(); return; }
-      TTS.stop(); $("#res").innerHTML=""; $("#tx").textContent="…";
-      rec = makeRecognizer({continuous:false, onText:(f,interim)=>{ $("#tx").textContent = (f+" "+interim).trim(); }, onEnd: t => finish(t || $("#tx").textContent.replace(/^…$/,"")) });
-      if (!rec) return; rec.start(); $("#mic").classList.add("on"); $("#mic").textContent="■"; $("#hint").textContent="Je vous écoute…";
-    };
+      const rx = $("#rc .rx"); if (rx){ rx.hidden = false; rx.innerHTML = renderTokens(r.tokens); }
+      record(r.score);
+      $("#res").innerHTML = `<div class="feedback ${r.score>=85?"ok":r.score>=60?"info":"ko"}"><b>${r.score} %</b> · ${r.score>=85?"Excellent !":r.score>=60?"Bien. Encore un essai ?":"Écoutez le modèle lentement, puis réessayez."}</div>`;
+    }});
   };
   show();
-  onLeave(()=>rec && rec.stop());
 };
 
 /* ----- Expression écrite ----- */
@@ -643,73 +775,195 @@ VIEWS.write = (id) => {
 /* ----- Expression orale ----- */
 VIEWS.speak = (id) => {
   if (!id){
-    html(`${top("Expression orale")}<div class="card small"><b>Format TCF Canada</b> · 12 minutes face à un examinateur.<br>Tâche 1 : entretien dirigé (2 min) · Tâche 2 : interaction, vous posez les questions (5 min 30 dont 2 min de préparation) · Tâche 3 : exprimer un point de vue (4 min 30).</div>` +
+    html(`${top("Expression orale")}<div class="card small"><b>Format TCF Canada</b> · 12 minutes face à un examinateur.<br>Tâche 1 : entretien dirigé (2 min) · Tâche 2 : interaction, vous posez les questions (5 min 30 dont 2 min de préparation) · Tâche 3 : exprimer un point de vue (4 min 30).</div>
+      <button class="list-item" data-go="#/talk"><span style="font-size:24px">💬</span><span class="grow"><span class="t">Conversation avec l'IA</span><br><span class="s">Une vraie discussion, à l'oral ou à l'écrit, avec corrections</span></span>›</button>` +
       [1,2,3].map(t=>`<h3 style="margin:18px 0 4px">Tâche ${t}</h3>`+SPEAKING.filter(s=>s.task===t).map(s=>{ const last=[...S.speaking].reverse().find(x=>x.id===s.id);
         return `<button class="list-item" data-go="#/speak/${s.id}"><span class="check ${last?"done":""}">${last?"✓":""}</span><span class="grow"><span class="s">${esc(s.prompt.slice(0,110))}${s.prompt.length>110?"…":""}</span>${last?.score!=null?`<br><span class="pill green" style="margin-top:4px">${last.score}/20</span>`:""}</span>›</button>`; }).join("")).join(""));
     return;
   }
   const t = SPEAKING.find(x=>x.id===id); if(!t) return VIEWS.speak();
-  const conv = t.task===2 && S.settings.apiKey && SR;
   html(`${top("Tâche "+t.task, "#/speak", `<span class="timer" id="tm">${fmt(t.prep||t.seconds)}</span>`)}
     <div class="card"><p class="fr" style="font-size:17.5px">${esc(t.prompt)}</p>${speakBtn(t.prompt)}
     <details style="margin-top:10px"><summary>Conseils</summary><ul style="margin:6px 0 0;padding-left:20px">${t.tips.map(x=>`<li>${esc(x)}</li>`).join("")}</ul></details>
     ${t.questions?`<details style="margin-top:6px"><summary>Exemples de questions</summary><ul style="margin:6px 0 0;padding-left:20px">${t.questions.map(x=>`<li class="fr" style="font-size:16px">${esc(x)}</li>`).join("")}</ul></details>`:""}</div>
-    ${t.task===2?`<div class="feedback info small">${conv?"Mode conversation : l'IA joue l'examinateur et vous répond à voix haute. Posez une question, puis arrêtez le micro.":"Posez vos questions à voix haute comme si l'examinateur était devant vous. Ajoutez une clé API dans Réglages pour que l'IA vous réponde."}</div>`:""}
+    ${t.task===2?`<button class="list-item" data-go="#/talk/eo-${t.id}"><span style="font-size:22px">💬</span><span class="grow"><span class="t">Faire cette tâche avec l'IA</span><br><span class="s">L'IA joue l'examinateur et vous répond vraiment</span></span>›</button>`:""}
     <div class="card center stack" style="margin-top:12px" id="stage">
-      ${t.prep?`<p class="muted">Préparation : ${t.prep/60} min. Notez vos idées.</p><button class="btn" id="prep">Commencer la préparation</button><button class="btn ghost" id="skip">Passer et parler</button>`:`<button class="btn" id="startTalk">🎙️ Commencer</button>`}
+      ${t.prep?`<div id="prepbox" class="stack"><p class="muted">Préparation : ${t.prep/60} min. Notez vos idées.</p><textarea id="notes" style="min-height:90px" placeholder="Vos notes…"></textarea>
+        <button class="btn" id="prep">Lancer la préparation</button><button class="btn ghost" id="skip">Passer et parler</button></div>`
+        :`<p class="muted" id="pre">Vous avez ${fmt(t.seconds)}. Le chrono démarre quand vous appuyez sur le micro.</p>`}
+      <div id="rc" ${t.prep?"hidden":""}></div>
     </div>
     <div id="after"></div>`);
-  let timer=null, rec=null, media=null, chunks=[], audioURL=null, startedAt=0, transcript="", history=[], busy=false;
-  const clear = () => { clearInterval(timer); rec && rec.stop(); try{ media && media.state!=="inactive" && media.stop(); }catch(e){} };
-  onLeave(clear);
-  const countdown = (secs, onEnd) => { let left=secs; clearInterval(timer); $("#tm").textContent=fmt(left);
-    timer=setInterval(()=>{ left--; $("#tm").textContent=fmt(Math.max(0,left)); $("#tm").classList.toggle("warn",left<=20); if(left<=0){ clearInterval(timer); onEnd(); } },1000); };
-  const startTalk = async () => {
-    $("#stage").innerHTML = `<button class="mic on" id="mic">■</button><div class="small muted" id="st">${conv?"Parlez… (appuyez pour envoyer)":"Parlez… appuyez pour terminer"}</div>
-      <div class="transcript" id="live" style="text-align:left"></div>${conv?`<div id="dlg" style="text-align:left"></div><button class="btn ghost sm" id="end" style="margin:0 auto">Terminer l'échange</button>`:""}`;
-    startedAt = Date.now(); countdown(t.seconds, () => stopAll());
-    try { const stream = await navigator.mediaDevices.getUserMedia({audio:true}); media = new MediaRecorder(stream); chunks=[];
-      media.ondataavailable = e => e.data.size && chunks.push(e.data); media.onstop = () => { stream.getTracks().forEach(tr=>tr.stop()); if(chunks.length){ audioURL = URL.createObjectURL(new Blob(chunks,{type:media.mimeType||"audio/mp4"})); const a=$("#playback"); if(a) a.src=audioURL; } };
-      media.start(); } catch(e){ /* recording optional */ }
-    if (!SR){ $("#live").innerHTML = `<span class="muted small">Transcription indisponible ici. Votre voix est quand même enregistrée.</span>`; }
-    if (conv){ listenTurn(); $("#end").onclick = () => stopAll(); $("#mic").onclick = () => { if (rec && rec.active) rec.stop(); else if(!busy) listenTurn(); }; }
-    else { if (SR){ rec = makeRecognizer({continuous:true, onText:(f,i)=>{ transcript=f; $("#live").textContent=(f+" "+i).trim(); }}); rec.start(); } $("#mic").onclick = () => stopAll(); }
-  };
-  const listenTurn = () => {
-    $("#mic").classList.add("on"); $("#mic").textContent="■"; $("#st").textContent="Parlez… (appuyez pour envoyer)";
-    rec = makeRecognizer({continuous:false, onText:(f,i)=>{ $("#live").textContent=(f+" "+i).trim(); }, onEnd: async said => {
-      $("#mic").classList.remove("on"); $("#mic").textContent="🎤";
-      said = said || $("#live").textContent; if (!said.trim()) { $("#st").textContent="Rien entendu. Appuyez pour réessayer."; return; }
-      history.push({role:"user",content:said}); transcript += (transcript?"\n":"")+"Moi : "+said;
-      $("#dlg").insertAdjacentHTML("beforeend", `<p><b>Vous :</b> ${esc(said)}</p>`); $("#live").textContent=""; busy=true; $("#st").textContent="L'examinateur répond…";
-      try { const reply = await chatWithAPI(`Tu es l'examinateur du TCF Canada, expression orale tâche 2. Tu joues le rôle décrit ici : ${t.prompt} Le candidat te pose des questions. Réponds en français, en 1 à 3 phrases courtes et naturelles, avec des détails concrets inventés et cohérents. Ne corrige pas le candidat et ne pose pas de questions sauf si nécessaire.`, history);
-        history.push({role:"assistant",content:reply}); transcript += "\nExaminateur : "+reply;
-        $("#dlg").insertAdjacentHTML("beforeend", `<p class="fr" style="font-size:16px"><b>Examinateur :</b> ${esc(reply)}</p>`);
-        TTS.speak(reply, {onend:()=>{ busy=false; $("#st").textContent="À vous. Appuyez sur le micro."; }});
-      } catch(e){ busy=false; $("#st").textContent="Erreur API. Vérifiez la clé."; }
-    }});
-    rec.start();
-  };
-  const stopAll = () => {
-    if (!$("#stage")) return; clear();
-    const secs = Math.round((Date.now()-startedAt)/1000);
-    const text = conv ? transcript : (transcript || $("#live")?.textContent || "");
+  let timer = null;
+  onLeave(() => clearInterval(timer));
+  const countdown = (secs, onEnd) => { let left = secs; clearInterval(timer); $("#tm").textContent = fmt(left);
+    timer = setInterval(() => { left--; const el=$("#tm"); if(!el) return clearInterval(timer); el.textContent = fmt(Math.max(0,left)); el.classList.toggle("warn", left<=20); if (left<=0){ clearInterval(timer); onEnd(); } }, 1000); };
+  const showRec = () => { const pb = $("#prepbox"); if (pb) pb.querySelector("#prep")?.remove(), pb.querySelector("#skip")?.remove(); $("#rc").hidden = false; $("#tm").textContent = fmt(t.seconds); $("#tm").classList.remove("warn"); };
+  recorder($("#rc"), {maxSecs: t.seconds + 5,
+    onStart: () => { const p=$("#pre"); if(p) p.remove(); countdown(t.seconds, () => { if (Mic.on) Mic.finish(); }); },
+    onStop: (text, secs) => { clearInterval(timer); results(text, secs); }});
+  const pb = $("#prep"); if (pb) pb.onclick = () => { pb.remove(); $("#skip").textContent = "J'ai fini, je parle"; countdown(t.prep, () => { showRec(); toast("À vous ! Appuyez sur le micro."); }); };
+  const sk = $("#skip"); if (sk) sk.onclick = () => { clearInterval(timer); showRec(); };
+  const results = (text, secs) => {
     const wc = (text.match(/\p{L}+/gu)||[]).length; const wpm = secs ? Math.round(wc/(secs/60)) : 0;
     const fillers = (text.toLowerCase().match(/\b(euh+|heu+|bah|ben|genre|du coup|en fait|tu vois)\b/g)||[]).length;
-    $("#stage").innerHTML = `<h3>Terminé · ${fmt(secs)}</h3>
+    $("#after").innerHTML = `<div class="card stack" style="margin-top:12px"><h3>Terminé · ${fmt(secs)}</h3>
       <div class="grid2" style="grid-template-columns:repeat(3,1fr)"><div class="stat"><b>${wc}</b><span>mots</span></div><div class="stat"><b>${wpm}</b><span>mots/min</span></div><div class="stat"><b>${fillers}</b><span>hésitations</span></div></div>
-      <audio id="playback" controls style="width:100%" ${audioURL?`src="${audioURL}"`:""}></audio>
-      <p class="small muted" style="text-align:left">Transcription (corrigez si la reconnaissance s'est trompée) :</p>
+      <p class="small muted">Transcription (corrigez-la si besoin, ou dictez avec le micro du clavier) :</p>
       <textarea id="ft" style="min-height:140px">${esc(text)}</textarea>
-      <button class="btn ghost" data-go="#/speak/${t.id}">↻ Recommencer</button>`;
-    gradingPanel($("#after"), "speak", t, ()=>$("#ft").value, score => { S.speaking.push({id:t.id, task:t.task, date:today(), score, words:wc}); if(S.speaking.length>60) S.speaking.shift(); save(); addXP(30); markDaily("speak"); });
+      <button class="btn ghost" data-go="#/speak/${t.id}">↻ Recommencer</button></div><div id="gp" style="margin-top:12px"></div>`;
+    gradingPanel($("#gp"), "speak", t, () => $("#ft").value, score => { S.speaking.push({id:t.id, task:t.task, date:today(), score, words:wc}); if(S.speaking.length>60) S.speaking.shift(); save(); addXP(30); });
     addXP(10); markDaily("speak");
+    $("#after").scrollIntoView({behavior:"smooth"});
   };
-  const sb = $("#startTalk"); if (sb) sb.onclick = startTalk;
-  const pb = $("#prep"); if (pb) pb.onclick = () => { pb.remove(); $("#skip").textContent="J'ai fini, je parle"; countdown(t.prep, () => startTalk()); };
-  const sk = $("#skip"); if (sk) sk.onclick = () => { clearInterval(timer); startTalk(); };
 };
-const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
+
+/* ----- AI conversation ----- */
+const LEVEL_STYLE = {
+  A1:"avec des phrases très courtes et très simples, au présent, avec le vocabulaire de base",
+  A2:"avec des phrases simples et courtes, au présent, au passé composé et au futur proche, avec un vocabulaire courant",
+  B1:"avec des phrases naturelles de longueur moyenne, des temps variés et quelques connecteurs",
+  B2:"de façon naturelle et nuancée, avec des connecteurs logiques, le subjonctif et le conditionnel quand c'est naturel"};
+function convFor(id){
+  if (id && id.startsWith("eo-")){ const t = SPEAKING.find(x=>x.id===id.slice(3)); if (t) return {id, level:S.level, emoji:"🎙️", title:"TCF · tâche 2",
+    role:"l'examinateur du TCF Canada qui joue le personnage décrit dans la consigne et répond aux questions du candidat avec des détails concrets", situation:t.prompt,
+    goal:"Poser des questions variées et pertinentes pour obtenir les informations", opener:"Bonjour ! Je vous écoute, posez-moi vos questions."}; }
+  return CONVOS.find(c=>c.id===id);
+}
+function claudePrompt(c){
+  return `Jouons une conversation en français pour m'entraîner au TCF Canada. Mon niveau est ${S.level}.
+Ton rôle : ${c.role}.
+Situation : ${c.situation}
+Mon objectif : ${c.goal}.
+Règles : parle uniquement en français, ${LEVEL_STYLE[S.level]}. Réponds en 1 à 3 phrases et relance-moi avec une question. Si je fais une erreur, ajoute à la fin une ligne « ✎ » avec ma phrase corrigée. Quand je dis « fin », fais un bilan : note sur 20, niveau CECR estimé, mes 3 erreurs principales et 5 mots utiles.
+Commence maintenant en disant : « ${c.opener} »`;
+}
+async function openInClaude(c){
+  const p = claudePrompt(c);
+  window.open("https://claude.ai/new?q="+encodeURIComponent(p), "_blank");
+  try { await navigator.clipboard.writeText(p); } catch(e){}
+}
+VIEWS.talk = id => id ? talkChat(id) : talkList();
+function talkList(){
+  const key = !!S.settings.apiKey;
+  const order = [S.level, ...LEVELS.filter(l=>l!==S.level)];
+  const done = id => (S.convos||[]).filter(x=>x.id===id).length;
+  html(`${top("Conversation IA")}
+    <p class="muted">Discutez avec une IA qui joue un rôle. Elle parle à votre niveau (${S.level}), corrige vos phrases et propose des idées de réponse. Parlez avec le micro ou écrivez.</p>
+    ${key ? "" : `<div class="card stack small"><b>Deux façons de discuter</b>
+      <div>💬 <b>Dans Parlons</b> : ajoutez une clé API Anthropic dans Réglages. Compter quelques centimes par conversation.</div>
+      <div>🆓 <b>Gratuit</b> : touchez « Claude ↗ » sur un scénario. L'app Claude s'ouvre avec le jeu de rôle prêt ; utilisez son mode vocal pour parler.</div>
+      <button class="btn sm soft" data-go="#/settings">Ajouter une clé API</button></div>`}
+    ${order.map(l => `<h3 style="margin:18px 0 4px">${l}${l===S.level?' <span class="pill">votre niveau</span>':""}</h3>` + CONVOS.filter(c=>c.level===l).map(c => `
+      <div class="list-item" style="cursor:default;flex-wrap:wrap"><span style="font-size:24px">${c.emoji}</span>
+        <span class="grow"><span class="t">${esc(c.title)}</span>${done(c.id)?` <span class="pill green">✓ ${done(c.id)}</span>`:""}<br><span class="s">${esc(c.goal)}</span></span>
+        <span class="row" style="gap:8px;width:100%;padding-left:36px">${key?`<button class="btn sm" style="flex:1" data-go="#/talk/${c.id}">💬 Parler</button>`:""}<button class="btn sm ghost" style="flex:1" data-claude="${c.id}">App Claude ↗</button></span></div>`).join("")).join("")}`);
+  $$("[data-claude]").forEach(b => b.onclick = () => openInClaude(convFor(b.dataset.claude)));
+}
+async function callClaude(system, messages, max_tokens=700){
+  const r = await fetch("https://api.anthropic.com/v1/messages", {method:"POST", headers:{"content-type":"application/json","x-api-key":S.settings.apiKey,
+    "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body: JSON.stringify({model:S.settings.model, max_tokens, system, messages})});
+  if (!r.ok){ let m = r.status+""; try { const j = await r.json(); m += " " + (j.error?.message||""); } catch(e){} throw new Error(m); }
+  const j = await r.json(); return j.content.map(c=>c.text||"").join("");
+}
+function parseTurn(txt){
+  try { const m = txt.match(/\{[\s\S]*\}/); const o = JSON.parse(m[0]); if (o && o.reply) return o; } catch(e){}
+  return {reply: txt.replace(/```(json)?/g,"").trim(), translation:"", correction:"", note:"", suggestions:[]};
+}
+function talkChat(id){
+  const c = convFor(id); if (!c) return talkList();
+  if (!S.settings.apiKey){
+    html(`${top(c.emoji+" "+esc(c.title), "#/talk")}<div class="card stack"><p>${esc(c.situation)}</p>
+      <p class="small muted">La conversation dans Parlons utilise votre propre clé API Anthropic. Sans clé, faites-la gratuitement dans l'app Claude avec le mode vocal.</p>
+      <button class="btn" id="oc">Ouvrir dans Claude ↗</button><button class="btn ghost" data-go="#/settings">Ajouter une clé API</button></div>`);
+    $("#oc").onclick = () => openInClaude(c); return;
+  }
+  const fbLang = S.settings.fbLang==="fr" ? "français" : "anglais";
+  const sys = `Tu joues un rôle dans une conversation de pratique orale avec un apprenant de français de niveau ${S.level} (CECR) qui prépare le TCF Canada.
+Ton rôle : ${c.role}.
+Situation : ${c.situation}
+Objectif de l'apprenant : ${c.goal}.
+Règles :
+- Parle uniquement en français, ${LEVEL_STYLE[S.level]}.
+- Réponds en 1 à 3 phrases, de façon naturelle et chaleureuse, puis relance avec une question pour faire parler l'apprenant.
+- Reste dans ton rôle et invente des détails concrets et cohérents.
+- Les messages de l'apprenant viennent souvent de la reconnaissance vocale : ignore la ponctuation et les majuscules manquantes.
+Réponds UNIQUEMENT avec un objet JSON valide, sans aucun texte autour, au format :
+{"reply":"ta réplique en français","translation":"traduction de ta réplique en anglais","correction":"le dernier message de l'apprenant corrigé et rendu naturel, ou une chaîne vide s'il était déjà correct","note":"explication très courte, en ${fbLang}, de l'erreur principale, ou une chaîne vide","suggestions":["deux ou trois réponses courtes que l'apprenant pourrait dire ensuite, à son niveau"]}`;
+  const opener = {reply:c.opener, translation:"", correction:"", note:"", suggestions:[]};
+  const history = [{role:"user", content:"(Début de la conversation. Commence.)"}, {role:"assistant", content:JSON.stringify(opener)}];
+  const log = [{role:"ai", text:c.opener}];
+  let busy = false, turns = 0, autoSpeak = S.settings.autoSpeak !== false;
+  html(`<div class="top"><button class="back" data-go="#/talk" aria-label="Retour">‹</button><h2 style="font-size:19px">${c.emoji} ${esc(c.title)}</h2>
+      <button class="btn sm ghost" id="as" title="Lecture automatique">${autoSpeak?"🔊":"🔇"}</button><button class="btn sm soft" id="end">Bilan</button></div>
+    <div class="small muted" style="margin:-6px 2px 10px">${esc(c.situation)}</div>
+    <div id="chat" class="chat"></div><div id="sugg" class="chips"></div><div id="fb"></div>
+    <div class="composer"><div id="rc"></div><textarea id="msg" rows="1" placeholder="Écrivez, ou appuyez sur 🎤 et parlez…"></textarea><button class="btn sm" id="send" aria-label="Envoyer">➤</button></div>`);
+  const chat = $("#chat"), msg = $("#msg");
+  const scroll = () => { const last = chat.lastElementChild; last && last.scrollIntoView({block:"end", behavior:"smooth"}); };
+  const aiBubble = t => { const d = document.createElement("div"); d.className = "bubble ai";
+    d.innerHTML = `<div class="fr">${esc(t.reply)}</div><div class="tools">${speakBtn(t.reply)}${t.translation?`<button class="btn sm ghost tr">EN</button>`:""}</div>${t.translation?`<div class="small muted trx" hidden>${esc(t.translation)}</div>`:""}`;
+    const tr = d.querySelector(".tr"); if (tr) tr.onclick = () => { const x = d.querySelector(".trx"); x.hidden = !x.hidden; };
+    chat.appendChild(d); scroll(); return d; };
+  const meBubble = text => { const d = document.createElement("div"); d.className = "bubble me"; d.innerHTML = `<div>${esc(text)}</div>`; chat.appendChild(d); scroll(); return d; };
+  const suggest = list => { $("#sugg").innerHTML = (list||[]).slice(0,3).map(s=>`<button class="chip">${esc(s)}</button>`).join("");
+    $$("#sugg .chip").forEach(b => b.onclick = () => { msg.value = b.textContent; msg.focus(); grow(); }); };
+  const grow = () => { msg.style.height = "auto"; msg.style.height = Math.min(140, msg.scrollHeight)+"px"; };
+  msg.addEventListener("input", grow);
+  aiBubble(opener); if (autoSpeak) TTS.speak(c.opener);
+  suggest(S.level==="A1"||S.level==="A2" ? ["Bonjour !", "Oui, merci.", "Pouvez-vous répéter, s'il vous plaît ?"] : []);
+  $("#as").onclick = () => { autoSpeak = !autoSpeak; S.settings.autoSpeak = autoSpeak; save(); $("#as").textContent = autoSpeak?"🔊":"🔇"; if (!autoSpeak) TTS.stop(); };
+  const send = async () => {
+    const text = msg.value.trim(); if (!text || busy) return;
+    busy = true; msg.value = ""; grow(); $("#sugg").innerHTML = ""; TTS.stop();
+    const me = meBubble(text); log.push({role:"me", text}); history.push({role:"user", content:text}); turns++;
+    const typing = document.createElement("div"); typing.className = "bubble ai typing"; typing.innerHTML = "<span></span><span></span><span></span>"; chat.appendChild(typing); scroll();
+    try {
+      const raw = await callClaude(sys, history, 700);
+      const t = parseTurn(raw); typing.remove();
+      history.push({role:"assistant", content:JSON.stringify(t)}); log.push({role:"ai", text:t.reply});
+      if (t.correction && t.correction.trim().toLowerCase().replace(/[^\p{L}]/gu,"") !== text.toLowerCase().replace(/[^\p{L}]/gu,""))
+        me.insertAdjacentHTML("beforeend", `<div class="corr">✎ ${esc(t.correction)}${t.note?`<div class="small">${esc(t.note)}</div>`:""}</div>`);
+      aiBubble(t); suggest(t.suggestions); addXP(3);
+      if (autoSpeak) TTS.speak(t.reply);
+    } catch(e){ typing.remove(); history.pop(); log.pop(); turns--; msg.value = text; grow(); toast("Erreur de l'API : "+e.message.slice(0,80), 4000); }
+    busy = false;
+  };
+  $("#send").onclick = send;
+  msg.addEventListener("keydown", e => { if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } });
+  recorder($("#rc"), {compact:true, autoStop:2000, maxSecs:90,
+    onLive: t => { msg.value = t; grow(); },
+    onStop: (text, secs, heard) => { if (text){ msg.value = text; grow(); send(); }
+      else toast(heard ? "Je vous ai entendu, mais pas compris. Réessayez, ou utilisez la dictée du clavier." : "Aucun son capté. Vérifiez le micro, ou écrivez votre message.", 3800); }});
+  $("#end").onclick = async () => {
+    if (turns < 2) return toast("Échangez au moins deux messages avant le bilan.");
+    if (busy) return; busy = true; TTS.stop(); if (Mic.on) Mic.stop();
+    const b = $("#end"); b.disabled = true; b.textContent = "…";
+    const transcript = log.map(m => (m.role==="me"?"Apprenant : ":"Interlocuteur : ")+m.text).join("\n");
+    const lang = S.settings.fbLang==="fr" ? "French" : "English (keep all corrections and examples in French)";
+    const prompt = `Here is a French speaking-practice conversation. Learner's target level: ${S.level} (TCF Canada). Scenario: ${c.title} — ${c.situation}
+
+${transcript}
+
+Evaluate ONLY the learner's messages (they may come from speech recognition, so ignore punctuation and capitalisation). Respond in ${lang}. Format exactly:
+SCORE: <0-20>/20 · CECR: <A1–C2>
+## What went well
+## Errors to fix (quote → correction → why)
+## 5 useful words or phrases for this situation
+## Next goal`;
+    try {
+      const res = await callClaude("You are a warm, precise TCF Canada speaking examiner.", [{role:"user", content:prompt}], 1500);
+      const m = res.match(/SCORE:\s*(\d{1,2})/i); const score = m ? +m[1] : null;
+      S.convos = S.convos || []; S.convos.push({id:c.id, date:today(), turns, score}); if (S.convos.length>100) S.convos.shift(); save();
+      addXP(15 + Math.min(turns, 10)*2); markDaily("speak");
+      $("#fb").innerHTML = `<div class="card stack" style="margin-top:12px"><h3>Bilan${score!=null?` · ${score}/20`:""}</h3><div class="grade-box">${mdLite(res)}</div>
+        <div class="row"><button class="btn sm soft" data-go="#/talk/${c.id}">↻ Recommencer</button><button class="btn sm ghost" data-go="#/talk">Autres scénarios</button></div></div>`;
+      $("#fb").scrollIntoView({behavior:"smooth"});
+    } catch(e){ toast("Erreur de l'API : "+e.message.slice(0,80), 4000); }
+    b.disabled = false; b.textContent = "Bilan"; busy = false;
+  };
+}
 
 /* ----- Mock exam ----- */
 VIEWS.exam = () => {
@@ -744,7 +998,7 @@ function runExam(){
       if (it>=part.items.length){ clearInterval(timer); p++; TTS.stop();
         app.innerHTML = `<div class="card center stack" style="margin-top:30px"><h2>${part.label} terminée</h2>${p<parts.length?`<button class="btn" id="nx">Épreuve suivante →</button>`:`<button class="btn" id="nx">Voir mes résultats</button>`}</div>`;
         $("#nx").onclick = startPart; return; }
-      const x = part.items[it]; const qsAnswered = [];
+      const x = shuffleDoc(part.items[it]); const qsAnswered = [];
       $("#ez").innerHTML = `<span class="pill gray">Document ${it+1}/${part.items.length}</span> <span class="pill">${esc(x.context)}</span>
         ${part.kind==="oral"?`<div class="card center" style="margin-top:10px"><button class="mic" id="pl" style="background:var(--blue);box-shadow:none">▶</button><div class="small muted" id="pc">Une seule écoute</div></div>`:`<div class="card" style="margin-top:10px"><div class="passage">${esc(x.text)}</div></div>`}
         ${x.questions.map((q,qi)=>`<div class="card" style="margin-top:10px" data-qi="${qi}"><p style="font-weight:600">${esc(q[0])}</p>${q[1].map((o,k)=>`<button class="opt" data-k="${k}">${esc(o)}</button>`).join("")}</div>`).join("")}
@@ -835,6 +1089,16 @@ VIEWS.settings = () => {
       <label class="small muted">Date de votre TCF</label><input type="text" id="ed" placeholder="AAAA-MM-JJ" value="${esc(S.examDate)}" inputmode="numeric">
       <label class="small muted">Nouveaux mots par jour</label><select id="np">${[5,8,10,15,20].map(n=>`<option ${n==S.settings.newPerDay?"selected":""}>${n}</option>`).join("")}</select>
     </div>
+    <div class="card stack" style="margin-top:12px"><h3>Apparence</h3>
+      <div class="seg" id="th"><button data-v="auto" class="${(S.settings.theme||"auto")==="auto"?"on":""}">Auto</button><button data-v="light" class="${S.settings.theme==="light"?"on":""}">☀️ Clair</button><button data-v="dark" class="${S.settings.theme==="dark"?"on":""}">🌙 Sombre</button></div>
+      <p class="small muted">Auto suit le mode sombre de votre téléphone.</p>
+    </div>
+    <div class="card stack" style="margin-top:12px"><h3>Micro</h3>
+      <label class="row between"><span>Transcription en direct</span><input type="checkbox" id="trs" ${S.settings.transcript!==false?"checked":""}></label>
+      <p class="small muted">Si le micro bloque, désactivez-la : l'app enregistre quand même votre voix pour que vous puissiez vous réécouter.</p>
+      <label class="row between"><span>Lire les réponses de l'IA à voix haute</span><input type="checkbox" id="asp" ${S.settings.autoSpeak!==false?"checked":""}></label>
+      <details><summary>Tester le micro</summary><p class="small muted">Dites une phrase. La barre bouge si le micro vous entend.</p><div id="mt"></div></details>
+    </div>
     <div class="card stack" style="margin-top:12px"><h3>Voix</h3>
       ${vs.length?`<select id="vc">${vs.map(v=>`<option value="${esc(v.name)}" ${v.name===S.settings.voice?"selected":""}>${esc(v.name)} (${v.lang})</option>`).join("")}</select>`:`<p class="small muted">Aucune voix française détectée. Sur iPhone : Réglages › Accessibilité › Contenu énoncé › Voix › Français, et téléchargez une voix « améliorée ».</p>`}
       <label class="small muted">Vitesse : <span id="rv">${S.settings.rate}</span></label><input type="range" id="rt" min="0.6" max="1.2" step="0.05" value="${S.settings.rate}" style="width:100%">
@@ -856,12 +1120,16 @@ VIEWS.settings = () => {
     </div>
     <div class="card stack" style="margin-top:12px"><h3>Installer l'app</h3>
       <p class="small">iPhone : ouvrez ce site dans Safari › bouton Partager › <b>Sur l'écran d'accueil</b>.<br>Android : Chrome › menu ⋮ › <b>Installer l'application</b>.</p></div>
-    <p class="center small muted" style="margin-top:16px">Parlons v1.0 · ${VOCAB.length} mots · ${GRAMMAR.length} leçons · ${ORAL.length+ECRIT.length} documents</p>`);
+    <p class="center small muted" style="margin-top:16px">Parlons v2.0 · ${VOCAB.length} mots · ${GRAMMAR.length} leçons · ${ORAL.length+ECRIT.length} documents · ${CONVOS.length} conversations</p>`);
   $$("#lv button").forEach(b=>b.onclick=()=>{ S.level=b.dataset.l; save(); $$("#lv button").forEach(x=>x.classList.toggle("on",x===b)); toast("Niveau : "+S.level); });
   $("#ed").onchange = e => { const v=e.target.value.trim(); if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) return toast("Format : 2027-03-15"); S.examDate=v; save(); toast("Date enregistrée"); };
   $("#np").onchange = e => { S.settings.newPerDay=+e.target.value; save(); };
   const vc=$("#vc"); if(vc) vc.onchange = e => { S.settings.voice=e.target.value; save(); TTS.speak("Voici ma voix."); };
   $("#rt").oninput = e => { S.settings.rate=+e.target.value; $("#rv").textContent=S.settings.rate; save(); };
+  $$("#th button").forEach(b=>b.onclick=()=>{ S.settings.theme=b.dataset.v; save(); applyTheme(); $$("#th button").forEach(x=>x.classList.toggle("on",x===b)); });
+  $("#trs").onchange = e => { S.settings.transcript = e.target.checked; save(); };
+  $("#asp").onchange = e => { S.settings.autoSpeak = e.target.checked; save(); };
+  recorder($("#mt"), {autoStop:2000, maxSecs:15, onStop:(t, secs, heard) => toast(t ? "✓ Le micro fonctionne." : heard ? "Le micro vous entend, mais la transcription ne marche pas. Désactivez-la ci-dessus." : "Aucun son capté. Autorisez le micro pour Safari.", 4000)});
   $$("#rl button").forEach(b=>b.onclick=()=>{ S.settings.recLang=b.dataset.v; save(); $$("#rl button").forEach(x=>x.classList.toggle("on",x===b)); });
   $$("#fl button").forEach(b=>b.onclick=()=>{ S.settings.fbLang=b.dataset.v; save(); $$("#fl button").forEach(x=>x.classList.toggle("on",x===b)); });
   $("#ak").onchange = e => { S.settings.apiKey=e.target.value.trim(); save(); toast(S.settings.apiKey?"Clé enregistrée":"Clé supprimée"); };
@@ -877,6 +1145,12 @@ VIEWS.settings = () => {
 };
 
 /* ---------------- Boot ---------------- */
+if (S.gen){ (S.gen.oral||[]).forEach(x=>ORAL.push(x)); (S.gen.ecrit||[]).forEach(x=>ECRIT.push(x)); }
+if (S.settings.newPerDay === 8) { S.settings.newPerDay = 10; save(); }
+function applyTheme(){ const t = S.settings.theme || "auto"; if (t==="auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
+  const dark = t==="dark" || (t==="auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+  const m = document.querySelector('meta[name="theme-color"]'); if (m) m.content = dark ? "#0F1424" : "#16213E"; }
+applyTheme(); try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme); } catch(e){}
 if ("serviceWorker" in navigator) window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(()=>{}));
 route();
 })();
