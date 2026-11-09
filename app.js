@@ -48,51 +48,68 @@ function toast(msg, ms=2400){ const t=document.createElement("div"); t.className
 const setAudioSession = t => { try { if (navigator.audioSession) navigator.audioSession.type = t; } catch(e){} };
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`;
 
-/* ---------------- Text-to-speech ---------------- */
+/* ---------------- Text-to-speech ----------------
+   iOS quirks handled here: (1) speaking right after cancel() can silently drop the first sentence, so we wait
+   a moment; (2) onend sometimes never fires, which used to freeze the queue and cut listening documents short,
+   so a watchdog moves on when the synthesizer has gone quiet; (3) utterances are kept referenced.            */
+const wait = ms => new Promise(r => setTimeout(r, ms));
 const TTS = {
-  voices:[], speaking:false, utts:[], gen:0, check:null,
+  voices:[], speaking:false, utts:[], gen:0, dog:null,
   load(){ try { const v = speechSynthesis.getVoices().filter(v=>/^fr/i.test(v.lang)); if (v.length) this.voices = v; } catch(e){} return this.voices; },
   voice(i=0){ const vs=this.load(); if(!vs.length) return null;
     const rank = v => (v.name===S.settings.voice?10:0) + (/premium/i.test(v.name)?3:/enhanced|amélioré/i.test(v.name)?2:0) + (/fr-FR/i.test(v.lang)?1:0) + (/(Amélie|Audrey|Thomas|Google|Denise|Marie)/i.test(v.name)?.5:0);
     const sorted = vs.slice().sort((a,b)=>rank(b)-rank(a)); const pref = sorted[0];
     if (i===0) return pref;
     return sorted.find(v=>v!==pref && v.lang===pref.lang) || sorted.find(v=>v!==pref) || pref; },
-  stop(){ this.gen++; this.speaking=false; this.utts=[]; clearTimeout(this.check); try { speechSynthesis.cancel(); } catch(e){} $$(".playing").forEach(b=>b.classList.remove("playing")); },
+  stop(){ this.gen++; this.speaking=false; this.utts=[]; clearInterval(this.dog); try { speechSynthesis.cancel(); } catch(e){} $$(".playing").forEach(b=>b.classList.remove("playing")); },
   speak(text, opts={}){
     if (!("speechSynthesis" in window)) { toast("La synthèse vocale n'est pas disponible sur cet appareil."); opts.onend && opts.onend(); return; }
+    if (typeof Listen !== "undefined" && Listen.busy) Listen.abort();
     if (Mic.on) Mic.stop();
-    this.stop(); setAudioSession("playback");
+    let busy = false; try { busy = speechSynthesis.speaking || speechSynthesis.pending; } catch(e){}
+    this.stop(); if (!Mic.stream) setAudioSession("playback");
     const gen = this.gen, rate = (opts.rate ?? S.settings.rate);
     const queue = [];
     for (const raw of String(text).split("\n").filter(Boolean)){
       let who = 0, line = raw; const m = raw.match(/^([AB]):\s*(.*)$/); if (m){ who = m[1]==="A"?0:1; line = m[2]; }
-      for (const part of line.split(/(?<=[.!?…;])\s+/)) if (part.trim()) queue.push({who, part:part.replace(/…/g,"...")});
+      for (const part of line.split(/(?<=[.!?…;])\s+/)) if (/[\p{L}\p{N}]/u.test(part)) queue.push({who, part:part.replace(/…/g,",")});
     }
     if (!queue.length){ opts.onend && opts.onend(); return; }
     this.speaking = true; opts.btn && opts.btn.classList.add("playing");
-    let i = 0, started = false;
-    const finish = () => { if (gen!==this.gen) return; this.speaking=false; clearTimeout(this.check); opts.btn && opts.btn.classList.remove("playing"); opts.onend && opts.onend(); };
+    let i = 0, cur = null, any = false, quiet = 0;
+    const finish = () => { if (gen!==this.gen) return; this.speaking=false; clearInterval(this.dog); opts.btn && opts.btn.classList.remove("playing"); opts.onend && opts.onend(); };
     const next = () => {
       if (gen!==this.gen) return;
       if (i >= queue.length) return finish();
       const {who, part} = queue[i++];
-      const u = new SpeechSynthesisUtterance(part);
-      this.utts.push(u); // keep a reference: iOS drops utterances that get garbage-collected (onend never fires)
+      const u = new SpeechSynthesisUtterance(part); this.utts.push(u);
       const v = this.voice(who); if (v){ u.voice = v; u.lang = v.lang; } else u.lang = "fr-FR";
       u.rate = rate; u.volume = 1; u.pitch = (who===1 && this.voice(1)===this.voice(0)) ? 0.8 : 1;
-      u.onstart = () => { started = true; };
-      u.onend = () => setTimeout(next, who!==(queue[i]?.who ?? who) ? 350 : 100);
-      u.onerror = e => { if (e && (e.error==="interrupted"||e.error==="canceled")) return; setTimeout(next, 50); };
+      const c = cur = {started:false, done:false, t0:Date.now(), gap: who!==(queue[i]?.who ?? who) ? 350 : 120};
+      c.advance = () => { if (c.done || gen!==this.gen) return; c.done = true; quiet = 0; setTimeout(next, c.gap); };
+      u.onstart = () => { c.started = true; any = true; };
+      u.onend = c.advance;
+      u.onerror = e => { if (gen!==this.gen) return; c.advance(); };
       speechSynthesis.speak(u); try { speechSynthesis.resume(); } catch(e){}
     };
-    next();
-    this.check = setTimeout(() => { if (gen===this.gen && !started && !speechSynthesis.speaking){ finish(); toast("Pas de son ? Montez le volume ou désactivez le mode silencieux, puis réessayez."); } }, 2500);
+    clearInterval(this.dog);
+    this.dog = setInterval(() => {
+      if (gen!==this.gen || !cur || cur.done) return;
+      let talking = false; try { talking = speechSynthesis.speaking || speechSynthesis.pending; } catch(e){}
+      if (talking){ cur.started = true; any = true; quiet = 0; return; }
+      if (cur.started){ if (++quiet >= 4) cur.advance(); return; }          // finished but onend never fired
+      if (Date.now() - cur.t0 > 4000){                                        // never started
+        if (!any){ finish(); toast("Pas de son ? Montez le volume ou désactivez le mode silencieux, puis réessayez.", 3500); }
+        else cur.advance();
+      }
+    }, 250);
+    setTimeout(next, busy ? 300 : 60);
   }
 };
 if ("speechSynthesis" in window){ TTS.load(); speechSynthesis.onvoiceschanged = () => TTS.load(); }
 // iOS only lets speech start from a tap. Prime it on the first tap so replies fetched later (AI conversation) can be spoken.
 (function unlockSpeech(){
-  const go = () => { try { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } catch(e){}
+  const go = () => { try { if (!speechSynthesis.speaking){ const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } } catch(e){}
     document.removeEventListener("touchend", go, true); document.removeEventListener("click", go, true); };
   document.addEventListener("touchend", go, true); document.addEventListener("click", go, true);
 })();
@@ -112,7 +129,8 @@ const Mic = {
   get text(){ return (this.final+" "+this.interim).replace(/\s+/g," ").trim(); },
   async start(opts={}){
     if (this.on || this.busy) return false;
-    this.busy = true; TTS.stop(); this.opts = opts; this.final=""; this.interim=""; this.secs=0; this.chunks=[]; this.heard=false;
+    this.busy = true; TTS.stop(); if (Listen.busy) Listen.abort(); await Promise.race([Listen.idle, wait(1600)]);
+    this.opts = opts; this.final=""; this.interim=""; this.secs=0; this.chunks=[]; this.heard=false;
     if (this.url){ try { URL.revokeObjectURL(this.url); } catch(e){} this.url=null; }
     try { setAudioSession("play-and-record"); this.stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}}); }
     catch(e){ this.busy=false; setAudioSession("playback"); toast("Micro bloqué. Autorisez-le dans Réglages › Safari › Microphone, ou écrivez votre réponse.", 4000); return false; }
@@ -177,10 +195,98 @@ const Mic = {
   finish(){ const t = this.stop(); const cb = this.opts.onStop; this.opts.onStop = null; cb && cb(t, this.secs, this.heard); }
 };
 
+/* ---------------- Short-turn listener ----------------
+   For one phrase or one conversational turn. Uses speech recognition ONLY (no second mic consumer, no audio
+   session switching) and never creates a new recognizer until iOS has released the previous one. That
+   overlap is what made the mic work for the first phrase and then go dead.
+   It stops by itself when you pause (that's how it knows you've finished), or when you tap stop.            */
+const Listen = {
+  busy:false, r:null, idle:Promise.resolve(), final:"", interim:"", err:"", heard:false, _done:null, _silent:false,
+  get text(){ return (this.final+" "+this.interim).replace(/\s+/g," ").trim(); },
+  available(){ return !!SR && S.settings.transcript !== false; },
+  async start({onText, onDone, onSpeech, maxSecs=40}={}){
+    if (this.busy || !SR) return false;
+    this.busy = true; TTS.stop(); if (Mic.on) Mic.stop();
+    await Promise.race([this.idle, wait(1600)]); await wait(180);
+    if (!this.busy) return false;                       // cancelled while waiting
+    this.final = ""; this.interim = ""; this.err = ""; this.heard = false; this._silent = false;
+    let release; this.idle = new Promise(res => release = res);
+    let r;
+    try { r = new SR(); } catch(e){ this.busy = false; release(); return false; }
+    this.r = r; r.lang = S.settings.recLang; r.continuous = false; r.interimResults = true; r.maxAlternatives = 1;
+    let ended = false;
+    const done = () => {
+      if (ended) return; ended = true; release();
+      clearTimeout(this.cap); clearTimeout(this.force);
+      if (this.r === r) this.r = null;
+      const silent = this._silent; this.busy = false; this._done = null;
+      if (!silent) onDone && onDone(this.text, this.err, this.heard);
+    };
+    this._done = done;
+    r.onresult = ev => { let interim = "";
+      for (let i=ev.resultIndex;i<ev.results.length;i++){ const res = ev.results[i]; if (res.isFinal) this.final += res[0].transcript.trim()+" "; else interim += res[0].transcript; }
+      this.interim = interim; this.heard = true; onText && onText(this.text); };
+    r.onspeechstart = () => { this.heard = true; onSpeech && onSpeech(); };
+    r.onerror = e => { this.err = (e && e.error) || "error"; };
+    r.onend = done;
+    try { r.start(); } catch(e){ this.err = "start"; done(); return false; }
+    this.cap = setTimeout(() => this.stop(), maxSecs*1000);
+    return true;
+  },
+  stop(){ const r = this.r; if (!r) { if (this.busy && !this._done) this.busy = false; return; }
+    try { r.stop(); } catch(e){}
+    clearTimeout(this.force); this.force = setTimeout(() => { try { r.abort(); } catch(e){} this._done && this._done(); }, 1500); },
+  abort(){ this._silent = true; if (!this.r){ this.busy = false; return; } const r = this.r; try { r.abort(); } catch(e){}
+    clearTimeout(this.force); this.force = setTimeout(() => this._done && this._done(), 800); }
+};
+window.Listen = Listen;
+const micErrorText = err => ({
+  "not-allowed":"Micro refusé. Sur iPhone : Réglages › Safari › Microphone › Autoriser, puis rouvrez l'app.",
+  "service-not-allowed":"La reconnaissance vocale est désactivée. Réglages › Général › Clavier › activez Dictée.",
+  "audio-capture":"Le micro est utilisé par une autre app. Fermez-la et réessayez.",
+  "network":"Pas de connexion pour la reconnaissance vocale. Vérifiez votre réseau.",
+  "no-speech":"Je n'ai rien entendu. Parlez un peu plus fort, juste après le bip."}[err] || "");
+
 window.Mic = Mic; // handy for debugging from the console
 
 // Reusable recorder widget: big mic toggle, level meter, timer, live transcript, a separate red Stop button, playback.
-function recorder(el, {autoStop=0, maxSecs=180, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive, compact=false}={}){
+function recorder(el, opts={}){
+  if (opts.quick && Listen.available()) return quickRecorder(el, opts);
+  return fullRecorder(el, opts);
+}
+// One phrase at a time: speech recognition only, stops by itself after a pause.
+function quickRecorder(el, {maxSecs=40, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive, compact=false}={}){
+  el.innerHTML = `<div class="rec ${compact?"compact":""}">
+    <button class="mic" type="button" aria-label="Parler">🎤</button>
+    <div class="level wave" aria-hidden="true"><i></i></div>
+    <div class="small muted rh center">${hint}</div>
+    <div class="transcript rx" hidden></div></div>`;
+  const q = s => el.querySelector(s);
+  const mic=q(".mic"), lvl=q(".level"), rh=q(".rh"), rx=q(".rx");
+  let t0 = 0;
+  const idle = () => { mic.classList.remove("on"); mic.textContent="🎤"; lvl.classList.remove("live","speech"); };
+  mic.onclick = async () => {
+    if (Listen.r) return Listen.stop();
+    if (Listen.busy) return;
+    rx.hidden = compact; rx.textContent = "…"; rh.textContent = "Un instant…";
+    mic.classList.add("on"); mic.textContent = "■";
+    const ok = await Listen.start({maxSecs,
+      onSpeech: () => lvl.classList.add("speech"),
+      onText: t => { rx.textContent = t || "…"; onLive && onLive(t); },
+      onDone: (text, err, heard) => { idle(); const secs = Math.max(1, Math.round((Date.now()-t0)/1000));
+        rh.textContent = "Appuyez sur le micro pour recommencer";
+        if (!text){ const m = micErrorText(err); rx.hidden = compact; rx.textContent = m || "Je n'ai pas compris. Réessayez en parlant près du téléphone.";
+          if (err==="not-allowed"||err==="service-not-allowed"||err==="audio-capture") toast(m, 5000); }
+        onStop && onStop(text, secs, heard); }});
+    if (!ok){ idle(); rh.textContent = "Le micro n'a pas démarré. Réessayez."; return; }
+    t0 = Date.now(); lvl.classList.add("live"); rh.textContent = "Je vous écoute… (ça s'arrête tout seul après une pause)";
+    onStart && onStart();
+  };
+  onLeave(() => Listen.abort());
+  return {stop: () => Listen.stop()};
+}
+// Long answers (TCF speaking tasks): records audio + live transcript, Intersection-style.
+function fullRecorder(el, {autoStop=0, maxSecs=180, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive, compact=false}={}){
   el.innerHTML = `<div class="rec ${compact?"compact":""}">
     <button class="mic" type="button" aria-label="Enregistrer">🎤</button>
     <div class="level" aria-hidden="true"><i></i></div>
@@ -714,7 +820,7 @@ VIEWS.pron = () => {
   const pool = shuffle(SENTENCES.filter(s=>upTo(S.level).includes(s.level)));
   let i = 0, sessionDone = 0;
   const record = score => { S.pron.n++; S.pron.sum += score; save(); addXP(Math.round(score/10)); sessionDone++; if (sessionDone>=3) markDaily("speak"); };
-  html(`${top("Prononciation")}<p class="muted">Écoutez le modèle, appuyez sur le micro et répétez. L'enregistrement s'arrête tout seul après une pause, ou appuyez sur ■.</p><div id="pz"></div>`);
+  html(`${top("Prononciation")}<p class="muted">Écoutez le modèle, appuyez sur 🎤 et répétez. Le micro s'arrête tout seul quand vous faites une pause.</p><div id="pz"></div>`);
   const show = () => {
     const s = pool[i % pool.length];
     $("#pz").innerHTML = `<div class="card stack center">
@@ -724,9 +830,9 @@ VIEWS.pron = () => {
       <div id="rc"></div><div id="res"></div>
       <button class="btn ghost" id="skip">Phrase suivante →</button></div>`;
     $("#skip").onclick = () => { i++; show(); };
-    recorder($("#rc"), {autoStop:1800, maxSecs:25, onStop:(text) => {
+    recorder($("#rc"), {quick:true, autoStop:1800, maxSecs:25, onStop:(text) => {
       if (!text){
-        $("#res").innerHTML = `<div class="feedback info">Réécoutez-vous et comparez au modèle, puis notez-vous :</div>
+        $("#res").innerHTML = `<div class="feedback info">Pas de transcription cette fois. Réessayez le micro, ou notez-vous en comparant au modèle :</div>
           <div class="grid2" style="grid-template-columns:1fr 1fr 1fr;margin-top:8px"><button class="btn sm red" data-self="40">À revoir</button><button class="btn sm soft" data-self="70">Bien</button><button class="btn sm green" data-self="95">Parfait</button></div>`;
         $$("#res [data-self]").forEach(b => b.onclick = () => { record(+b.dataset.self); $("#res").innerHTML = `<div class="feedback ok">Noté. Phrase suivante quand vous voulez.</div>`; });
         return;
@@ -875,7 +981,7 @@ function talkChat(id){
   const c = convFor(id); if (!c) return talkList();
   if (!S.settings.apiKey){
     html(`${top(c.emoji+" "+esc(c.title), "#/talk")}<div class="card stack"><p>${esc(c.situation)}</p>
-      <p class="small muted">La conversation dans Parlons utilise votre propre clé API Anthropic. Sans clé, faites-la gratuitement dans l'app Claude avec le mode vocal.</p>
+      <p class="small muted">La conversation vocale dans Parlons utilise votre propre clé API Anthropic (Réglages). Sans clé, faites-la gratuitement dans l'app Claude : le scénario s'ouvre, puis touchez le bouton <b>mode vocal</b> (l'onde sonore à droite du champ), pas le micro du clavier, qui ne fait que dicter du texte.</p>
       <button class="btn" id="oc">Ouvrir dans Claude ↗</button><button class="btn ghost" data-go="#/settings">Ajouter une clé API</button></div>`);
     $("#oc").onclick = () => openInClaude(c); return;
   }
@@ -895,11 +1001,19 @@ Réponds UNIQUEMENT avec un objet JSON valide, sans aucun texte autour, au forma
   const history = [{role:"user", content:"(Début de la conversation. Commence.)"}, {role:"assistant", content:JSON.stringify(opener)}];
   const log = [{role:"ai", text:c.opener}];
   let busy = false, turns = 0, autoSpeak = S.settings.autoSpeak !== false;
+  const canCall = Listen.available();
+  let mode = canCall && S.settings.talkMode !== "text" ? "voice" : "text";
   html(`<div class="top"><button class="back" data-go="#/talk" aria-label="Retour">‹</button><h2 style="font-size:19px">${c.emoji} ${esc(c.title)}</h2>
-      <button class="btn sm ghost" id="as" title="Lecture automatique">${autoSpeak?"🔊":"🔇"}</button><button class="btn sm soft" id="end">Bilan</button></div>
+      <button class="btn sm soft" id="end">Bilan</button></div>
     <div class="small muted" style="margin:-6px 2px 10px">${esc(c.situation)}</div>
+    ${canCall ? `<div class="seg" id="tm" style="margin-bottom:12px"><button data-m="voice">📞 Conversation vocale</button><button data-m="text">⌨️ Écrire</button></div>` : ""}
     <div id="chat" class="chat"></div><div id="sugg" class="chips"></div><div id="fb"></div>
-    <div class="composer"><div id="rc"></div><textarea id="msg" rows="1" placeholder="Écrivez, ou appuyez sur 🎤 et parlez…"></textarea><button class="btn sm" id="send" aria-label="Envoyer">➤</button></div>`);
+    <div class="callbar" id="callbar" hidden>
+      <div class="small muted center" id="cstat">Touchez pour commencer l'appel</div>
+      <div class="transcript center" id="clive" hidden></div>
+      <div class="row" style="justify-content:center;gap:14px"><button class="orb" id="orb" aria-label="Parler">📞</button><button class="btn sm ghost" id="hang" hidden>⏸ Pause</button></div>
+    </div>
+    <div class="composer" id="composer"><textarea id="msg" rows="1" placeholder="Écrivez votre réponse…"></textarea><button class="btn sm" id="send" aria-label="Envoyer">➤</button></div>`);
   const chat = $("#chat"), msg = $("#msg");
   const scroll = () => { const last = chat.lastElementChild; last && last.scrollIntoView({block:"end", behavior:"smooth"}); };
   const aiBubble = t => { const d = document.createElement("div"); d.className = "bubble ai";
@@ -911,12 +1025,11 @@ Réponds UNIQUEMENT avec un objet JSON valide, sans aucun texte autour, au forma
     $$("#sugg .chip").forEach(b => b.onclick = () => { msg.value = b.textContent; msg.focus(); grow(); }); };
   const grow = () => { msg.style.height = "auto"; msg.style.height = Math.min(140, msg.scrollHeight)+"px"; };
   msg.addEventListener("input", grow);
-  aiBubble(opener); if (autoSpeak) TTS.speak(c.opener);
+  aiBubble(opener);
   suggest(S.level==="A1"||S.level==="A2" ? ["Bonjour !", "Oui, merci.", "Pouvez-vous répéter, s'il vous plaît ?"] : []);
-  $("#as").onclick = () => { autoSpeak = !autoSpeak; S.settings.autoSpeak = autoSpeak; save(); $("#as").textContent = autoSpeak?"🔊":"🔇"; if (!autoSpeak) TTS.stop(); };
-  const send = async () => {
-    const text = msg.value.trim(); if (!text || busy) return;
-    busy = true; msg.value = ""; grow(); $("#sugg").innerHTML = ""; TTS.stop();
+  const send = async (spoken) => {
+    const text = (typeof spoken === "string" ? spoken : msg.value).trim(); if (!text || busy) return;
+    busy = true; if (typeof spoken !== "string"){ msg.value = ""; grow(); } $("#sugg").innerHTML = ""; TTS.stop();
     const me = meBubble(text); log.push({role:"me", text}); history.push({role:"user", content:text}); turns++;
     const typing = document.createElement("div"); typing.className = "bubble ai typing"; typing.innerHTML = "<span></span><span></span><span></span>"; chat.appendChild(typing); scroll();
     try {
@@ -925,20 +1038,65 @@ Réponds UNIQUEMENT avec un objet JSON valide, sans aucun texte autour, au forma
       history.push({role:"assistant", content:JSON.stringify(t)}); log.push({role:"ai", text:t.reply});
       if (t.correction && t.correction.trim().toLowerCase().replace(/[^\p{L}]/gu,"") !== text.toLowerCase().replace(/[^\p{L}]/gu,""))
         me.insertAdjacentHTML("beforeend", `<div class="corr">✎ ${esc(t.correction)}${t.note?`<div class="small">${esc(t.note)}</div>`:""}</div>`);
-      aiBubble(t); suggest(t.suggestions); addXP(3);
-      if (autoSpeak) TTS.speak(t.reply);
-    } catch(e){ typing.remove(); history.pop(); log.pop(); turns--; msg.value = text; grow(); toast("Erreur de l'API : "+e.message.slice(0,80), 4000); }
+      aiBubble(t); if (mode==="text") suggest(t.suggestions); addXP(3);
+      busy = false;
+      if (mode==="voice" && call.on) { status("speaking"); TTS.speak(t.reply, {onend: () => { if (call.on) setTimeout(listenTurn, 350); }}); }
+      else if (autoSpeak) TTS.speak(t.reply);
+      return;
+    } catch(e){ typing.remove(); history.pop(); log.pop(); turns--; if (typeof spoken !== "string"){ msg.value = text; grow(); }
+      toast("Erreur de l'API : "+e.message.slice(0,80), 4000); if (call.on) pauseCall(); }
     busy = false;
   };
-  $("#send").onclick = send;
+  $("#send").onclick = () => send();
   msg.addEventListener("keydown", e => { if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } });
-  recorder($("#rc"), {compact:true, autoStop:2000, maxSecs:90,
-    onLive: t => { msg.value = t; grow(); },
-    onStop: (text, secs, heard) => { if (text){ msg.value = text; grow(); send(); }
-      else toast(heard ? "Je vous ai entendu, mais pas compris. Réessayez, ou utilisez la dictée du clavier." : "Aucun son capté. Vérifiez le micro, ou écrivez votre message.", 3800); }});
+
+  // ---- Voice call: you talk, it answers out loud, then listens again. No buttons between turns. ----
+  const call = {on:false, misses:0, started:false};
+  const orb = $("#orb"), cstat = $("#cstat"), clive = $("#clive"), hang = $("#hang");
+  const status = st => {
+    orb.className = "orb " + st;
+    const t = {idle:["📞", call.started ? "En pause. Touchez pour reprendre." : "Touchez pour commencer l'appel"],
+      listening:["🎤","Je vous écoute… parlez, puis faites une pause"], thinking:["…","Réflexion…"],
+      speaking:["🔊","Votre interlocuteur parle… touchez pour l'interrompre"]}[st];
+    orb.textContent = t[0]; cstat.textContent = t[1]; hang.hidden = st==="idle";
+    if (st!=="listening") clive.hidden = true;
+  };
+  const listenTurn = async () => {
+    if (!call.on || busy) return;
+    status("listening"); clive.hidden = false; clive.textContent = "…";
+    const ok = await Listen.start({maxSecs:60,
+      onText: t => { clive.textContent = t; },
+      onDone: (text, err) => {
+        if (!call.on) return;
+        if (text){ call.misses = 0; status("thinking"); send(text); return; }
+        const m = micErrorText(err);
+        if (err==="not-allowed"||err==="service-not-allowed"||err==="audio-capture"){ toast(m, 5000); return pauseCall(); }
+        if (++call.misses >= 3){ toast("Je ne vous entends pas. L'appel est en pause.", 3500); return pauseCall(); }
+        setTimeout(listenTurn, 300);
+      }});
+    if (!ok && call.on){ setTimeout(listenTurn, 600); }
+  };
+  const pauseCall = () => { call.on = false; Listen.abort(); TTS.stop(); status("idle"); };
+  orb.onclick = () => {
+    if (!call.on){ call.on = true; call.misses = 0;
+      if (!call.started){ call.started = true; status("speaking"); TTS.speak(c.opener, {onend: () => { if (call.on) setTimeout(listenTurn, 350); }}); }
+      else listenTurn();
+      return; }
+    if (orb.classList.contains("listening")) return Listen.stop();          // done talking: send now
+    if (orb.classList.contains("speaking")){ TTS.stop(); setTimeout(listenTurn, 250); }   // interrupt
+  };
+  hang.onclick = pauseCall;
+  const setMode = m => { mode = m; S.settings.talkMode = m; save();
+    $$("#tm button").forEach(b => b.classList.toggle("on", b.dataset.m===m));
+    $("#callbar").hidden = m!=="voice"; $("#composer").hidden = m==="voice";
+    if (m==="text"){ pauseCall(); suggest(S.level==="A1"||S.level==="A2" ? ["Bonjour !", "Oui, merci.", "Pouvez-vous répéter, s'il vous plaît ?"] : []); }
+    else $("#sugg").innerHTML = ""; };
+  $$("#tm button").forEach(b => b.onclick = () => setMode(b.dataset.m));
+  setMode(mode); status("idle");
+  onLeave(() => { call.on = false; Listen.abort(); });
   $("#end").onclick = async () => {
     if (turns < 2) return toast("Échangez au moins deux messages avant le bilan.");
-    if (busy) return; busy = true; TTS.stop(); if (Mic.on) Mic.stop();
+    if (busy) return; pauseCall(); busy = true;
     const b = $("#end"); b.disabled = true; b.textContent = "…";
     const transcript = log.map(m => (m.role==="me"?"Apprenant : ":"Interlocuteur : ")+m.text).join("\n");
     const lang = S.settings.fbLang==="fr" ? "French" : "English (keep all corrections and examples in French)";
@@ -1003,7 +1161,11 @@ function runExam(){
         ${part.kind==="oral"?`<div class="card center" style="margin-top:10px"><button class="mic" id="pl" style="background:var(--blue);box-shadow:none">▶</button><div class="small muted" id="pc">Une seule écoute</div></div>`:`<div class="card" style="margin-top:10px"><div class="passage">${esc(x.text)}</div></div>`}
         ${x.questions.map((q,qi)=>`<div class="card" style="margin-top:10px" data-qi="${qi}"><p style="font-weight:600">${esc(q[0])}</p>${q[1].map((o,k)=>`<button class="opt" data-k="${k}">${esc(o)}</button>`).join("")}</div>`).join("")}
         <button class="btn" id="nxt" style="margin-top:12px" disabled>Suivant →</button>`;
-      if (part.kind==="oral"){ let used=false; $("#pl").onclick=()=>{ if(used) return; used=true; $("#pl").disabled=true; $("#pl").style.opacity=.4; $("#pc").textContent="Écoute en cours…"; TTS.speak(x.text,{onend:()=>$("#pc").textContent="Répondez aux questions"}); }; }
+      if (part.kind==="oral"){ let used=false;
+        const play = () => { $("#pl").disabled=true; $("#pl").style.opacity=.4; $("#pc").textContent="Écoute en cours…";
+          TTS.speak(x.text,{onend:()=>{ const pc=$("#pc"); if(!pc) return; pc.innerHTML=`Répondez aux questions. <button class="btn sm ghost" id="rep" style="margin:8px auto 0">🔁 Le son s'est coupé ? Réécouter</button>`;
+            $("#rep").onclick = () => { $("#rep").remove(); play(); }; }}); };
+        $("#pl").onclick=()=>{ if(used) return; used=true; play(); }; }
       $$("#ez [data-qi]").forEach(card=>{ const qi=+card.dataset.qi;
         $$(".opt",card).forEach(b=>b.onclick=()=>{ $$(".opt",card).forEach(o=>o.style.borderColor=""); b.style.borderColor="var(--blue)"; qsAnswered[qi]=+b.dataset.k;
           if (qsAnswered.filter(v=>v!==undefined).length===x.questions.length) $("#nxt").disabled=false; }); });
@@ -1120,7 +1282,7 @@ VIEWS.settings = () => {
     </div>
     <div class="card stack" style="margin-top:12px"><h3>Installer l'app</h3>
       <p class="small">iPhone : ouvrez ce site dans Safari › bouton Partager › <b>Sur l'écran d'accueil</b>.<br>Android : Chrome › menu ⋮ › <b>Installer l'application</b>.</p></div>
-    <p class="center small muted" style="margin-top:16px">Parlons v2.0 · ${VOCAB.length} mots · ${GRAMMAR.length} leçons · ${ORAL.length+ECRIT.length} documents · ${CONVOS.length} conversations</p>`);
+    <p class="center small muted" style="margin-top:16px">Parlons v2.1 · ${VOCAB.length} mots · ${GRAMMAR.length} leçons · ${ORAL.length+ECRIT.length} documents · ${CONVOS.length} conversations</p>`);
   $$("#lv button").forEach(b=>b.onclick=()=>{ S.level=b.dataset.l; save(); $$("#lv button").forEach(x=>x.classList.toggle("on",x===b)); toast("Niveau : "+S.level); });
   $("#ed").onchange = e => { const v=e.target.value.trim(); if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) return toast("Format : 2027-03-15"); S.examDate=v; save(); toast("Date enregistrée"); };
   $("#np").onchange = e => { S.settings.newPerDay=+e.target.value; save(); };
@@ -1129,7 +1291,7 @@ VIEWS.settings = () => {
   $$("#th button").forEach(b=>b.onclick=()=>{ S.settings.theme=b.dataset.v; save(); applyTheme(); $$("#th button").forEach(x=>x.classList.toggle("on",x===b)); });
   $("#trs").onchange = e => { S.settings.transcript = e.target.checked; save(); };
   $("#asp").onchange = e => { S.settings.autoSpeak = e.target.checked; save(); };
-  recorder($("#mt"), {autoStop:2000, maxSecs:15, onStop:(t, secs, heard) => toast(t ? "✓ Le micro fonctionne." : heard ? "Le micro vous entend, mais la transcription ne marche pas. Désactivez-la ci-dessus." : "Aucun son capté. Autorisez le micro pour Safari.", 4000)});
+  recorder($("#mt"), {quick:true, autoStop:2000, maxSecs:15, onStop:(t, secs, heard) => toast(t ? "✓ Le micro fonctionne." : heard ? "Le micro vous entend, mais la transcription ne marche pas. Désactivez-la ci-dessus." : "Aucun son capté. Autorisez le micro pour Safari.", 4000)});
   $$("#rl button").forEach(b=>b.onclick=()=>{ S.settings.recLang=b.dataset.v; save(); $$("#rl button").forEach(x=>x.classList.toggle("on",x===b)); });
   $$("#fl button").forEach(b=>b.onclick=()=>{ S.settings.fbLang=b.dataset.v; save(); $$("#fl button").forEach(x=>x.classList.toggle("on",x===b)); });
   $("#ak").onchange = e => { S.settings.apiKey=e.target.value.trim(); save(); toast(S.settings.apiKey?"Clé enregistrée":"Clé supprimée"); };
