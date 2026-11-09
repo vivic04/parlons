@@ -1,6 +1,7 @@
 /* Parlons — TCF French trainer (A1 → B2). No build step, no backend. */
 (() => {
 "use strict";
+const APP_VERSION = "2.2";
 const LEVELS = ["A1","A2","B1","B2"];
 const LKEY = "parlons-v1";
 const $ = (s, r=document) => r.querySelector(s);
@@ -210,6 +211,8 @@ const Listen = {
     await Promise.race([this.idle, wait(1600)]); await wait(180);
     if (!this.busy) return false;                       // cancelled while waiting
     this.final = ""; this.interim = ""; this.err = ""; this.heard = false; this._silent = false;
+    // Playing the model sentence puts iOS in "playback" mode, which leaves the mic deaf. Hand control back first.
+    setAudioSession("auto"); await wait(120);
     let release; this.idle = new Promise(res => release = res);
     let r;
     try { r = new SR(); } catch(e){ this.busy = false; release(); return false; }
@@ -1282,7 +1285,7 @@ VIEWS.settings = () => {
     </div>
     <div class="card stack" style="margin-top:12px"><h3>Installer l'app</h3>
       <p class="small">iPhone : ouvrez ce site dans Safari › bouton Partager › <b>Sur l'écran d'accueil</b>.<br>Android : Chrome › menu ⋮ › <b>Installer l'application</b>.</p></div>
-    <p class="center small muted" style="margin-top:16px">Parlons v2.1 · ${VOCAB.length} mots · ${GRAMMAR.length} leçons · ${ORAL.length+ECRIT.length} documents · ${CONVOS.length} conversations</p>`);
+    <p class="center small muted" style="margin-top:16px">Parlons v${APP_VERSION} · ${VOCAB.length} mots · ${GRAMMAR.length} leçons · ${ORAL.length+ECRIT.length} documents · ${CONVOS.length} conversations</p>`);
   $$("#lv button").forEach(b=>b.onclick=()=>{ S.level=b.dataset.l; save(); $$("#lv button").forEach(x=>x.classList.toggle("on",x===b)); toast("Niveau : "+S.level); });
   $("#ed").onchange = e => { const v=e.target.value.trim(); if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) return toast("Format : 2027-03-15"); S.examDate=v; save(); toast("Date enregistrée"); };
   $("#np").onchange = e => { S.settings.newPerDay=+e.target.value; save(); };
@@ -1305,6 +1308,31 @@ VIEWS.settings = () => {
   $("#im").onchange = e => { const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ try{ const d=JSON.parse(r.result); if(!d.srs) throw 0; const key=S.settings.apiKey; S=Object.assign(structuredClone(DEFAULT), d); S.settings=Object.assign(structuredClone(DEFAULT.settings), d.settings||{}, {apiKey:key}); save(); toast("Progression importée"); route(); }catch(err){ toast("Fichier invalide"); } }; r.readAsText(f); };
   $("#rs").onclick = () => { if (confirm("Effacer toute votre progression ? Cette action est définitive.")) { localStorage.removeItem(LKEY); location.hash="#/onboard"; location.reload(); } };
 };
+
+/* ---------------- Updates ----------------
+   Home-screen apps can keep running an old version. Check for a new one on launch and whenever the app comes
+   back to the foreground; update straight away on the home screen, otherwise offer a banner.                */
+async function applyUpdate(){
+  try { const regs = await navigator.serviceWorker?.getRegistrations?.() || []; await Promise.all(regs.map(r => r.update().catch(()=>{}))); } catch(e){}
+  try { const ks = await caches.keys(); await Promise.all(ks.map(k => caches.delete(k))); } catch(e){}
+  location.reload();
+}
+let updateShown = false;
+async function checkUpdate(){
+  try {
+    const r = await fetch("version.json?t=" + Date.now(), {cache:"no-store"}); if (!r.ok) return;
+    const {v} = await r.json(); if (!v || v === APP_VERSION) return;
+    const path = location.hash.slice(2).split("/")[0] || "home";
+    let tried = ""; try { tried = sessionStorage.getItem("parlons-upd") || ""; } catch(e){}
+    if ((path === "home" || path === "onboard") && tried !== v){ try { sessionStorage.setItem("parlons-upd", v); } catch(e){} return applyUpdate(); }
+    if (updateShown) return; updateShown = true;
+    const b = document.createElement("div"); b.className = "update-bar";
+    b.innerHTML = `<span>Nouvelle version (${esc(v)}) disponible</span><button class="btn sm white">Mettre à jour</button>`;
+    b.querySelector("button").onclick = applyUpdate; document.body.appendChild(b);
+  } catch(e){}
+}
+checkUpdate();
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") checkUpdate(); });
 
 /* ---------------- Boot ---------------- */
 if (S.gen){ (S.gen.oral||[]).forEach(x=>ORAL.push(x)); (S.gen.ecrit||[]).forEach(x=>ECRIT.push(x)); }
