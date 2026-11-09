@@ -1,7 +1,7 @@
 /* Parlons — TCF French trainer (A1 → B2). No build step, no backend. */
 (() => {
 "use strict";
-const APP_VERSION = "2.2";
+const APP_VERSION = "2.3";
 const LEVELS = ["A1","A2","B1","B2"];
 const LKEY = "parlons-v1";
 const $ = (s, r=document) => r.querySelector(s);
@@ -133,7 +133,8 @@ const Mic = {
     this.busy = true; TTS.stop(); if (Listen.busy) Listen.abort(); await Promise.race([Listen.idle, wait(1600)]);
     this.opts = opts; this.final=""; this.interim=""; this.secs=0; this.chunks=[]; this.heard=false;
     if (this.url){ try { URL.revokeObjectURL(this.url); } catch(e){} this.url=null; }
-    try { setAudioSession("play-and-record"); this.stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}}); }
+    try { setAudioSession("play-and-record");
+      this.stream = await Promise.race([navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true}}), wait(6000).then(()=>{ throw new Error("timeout"); })]); }
     catch(e){ this.busy=false; setAudioSession("playback"); toast("Micro bloqué. Autorisez-le dans Réglages › Safari › Microphone, ou écrivez votre réponse.", 4000); return false; }
     try {
       const has = t => window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t);
@@ -196,69 +197,111 @@ const Mic = {
   finish(){ const t = this.stop(); const cb = this.opts.onStop; this.opts.onStop = null; cb && cb(t, this.secs, this.heard); }
 };
 
-/* ---------------- Short-turn listener ----------------
-   For one phrase or one conversational turn. Uses speech recognition ONLY (no second mic consumer, no audio
-   session switching) and never creates a new recognizer until iOS has released the previous one. That
-   overlap is what made the mic work for the first phrase and then go dead.
-   It stops by itself when you pause (that's how it knows you've finished), or when you tap stop.            */
+/* ---------------- Voice engine (speech recognition only) ----------------
+   Every screen goes through this one engine. It never asks iOS for the microphone through getUserMedia (on a
+   home-screen app a second request can hang), never runs two recognizers at once, and reuses one recognizer.
+   If an attempt comes back completely dead (no start, no audio, no words), it switches strategy for the next one
+   (reuse ⇄ fresh). Everything is logged so a real iPhone failure can be diagnosed (Réglages › Micro).          */
+const PAGE_T0 = Date.now();
 const Listen = {
-  busy:false, r:null, idle:Promise.resolve(), final:"", interim:"", err:"", heard:false, _done:null, _silent:false,
+  busy:false, r:null, inst:null, idle:Promise.resolve(), final:"", interim:"", err:"", heard:false,
+  _done:null, _silent:false, _stopping:false, log:[], n:0, strategy:"reuse", deadStreak:0,
   get text(){ return (this.final+" "+this.interim).replace(/\s+/g," ").trim(); },
   available(){ return !!SR && S.settings.transcript !== false; },
-  async start({onText, onDone, onSpeech, maxSecs=40}={}){
+  note(ev){ this.log.push(((Date.now()-PAGE_T0)/1000).toFixed(1)+"s "+ev); if (this.log.length > 150) this.log.shift(); },
+  rec(){ if (this.strategy === "reuse" && this.inst) return this.inst; const r = new SR(); this.inst = r; return r; },
+  async start(opts={}, retry=false){
+    const {onText, onDone, onSpeech, maxSecs=40, continuous=false} = opts;
     if (this.busy || !SR) return false;
     this.busy = true; TTS.stop(); if (Mic.on) Mic.stop();
     await Promise.race([this.idle, wait(1600)]); await wait(180);
-    if (!this.busy) return false;                       // cancelled while waiting
-    this.final = ""; this.interim = ""; this.err = ""; this.heard = false; this._silent = false;
-    // Playing the model sentence puts iOS in "playback" mode, which leaves the mic deaf. Hand control back first.
-    setAudioSession("auto"); await wait(120);
-    let release; this.idle = new Promise(res => release = res);
-    let r;
-    try { r = new SR(); } catch(e){ this.busy = false; release(); return false; }
-    this.r = r; r.lang = S.settings.recLang; r.continuous = false; r.interimResults = true; r.maxAlternatives = 1;
-    let ended = false;
+    if (!this.busy) return false;
+    this.final = ""; this.interim = ""; this.err = ""; this.heard = false; this._silent = false; this._stopping = false;
+    setAudioSession("auto"); await wait(120);   // playing a model sentence leaves iOS in "playback": hand the mic back
+    const n = ++this.n; let release; this.idle = new Promise(res => release = res);
+    let r; try { r = this.rec(); } catch(e){ this.note(`#${n} cannot create recognizer: ${e.message}`); this.busy = false; release(); return false; }
+    this.r = r; r.lang = S.settings.recLang; r.continuous = continuous; r.interimResults = true; r.maxAlternatives = 1;
+    const got = {start:false, audio:false, speech:false, result:false};
+    let ended = false, restarts = 0, lastStart = Date.now();
+    this.note(`#${n} start · ${this.strategy} · ${continuous?"long":"short"} · ${r.lang}`);
     const done = () => {
       if (ended) return; ended = true; release();
       clearTimeout(this.cap); clearTimeout(this.force);
       if (this.r === r) this.r = null;
+      const dead = !got.start && !got.audio && !got.result;
+      if (dead && !this._silent){ this.deadStreak++; this.strategy = this.strategy === "reuse" ? "fresh" : "reuse"; this.inst = null;
+        this.note(`#${n} dead attempt → next uses "${this.strategy}"`);
+        if (!retry && !this._stopping){ this.busy = false; this._done = null; this.note(`#${n} retrying automatically`);
+          this.start(opts, true).then(ok => { if (!ok) onDone && onDone("", this.err || "start", false); }); return; } }
+      else if (!dead) this.deadStreak = 0;
+      this.note(`#${n} done · "${this.text.slice(0,40)}"${this.err?" · err "+this.err:""}`);
       const silent = this._silent; this.busy = false; this._done = null;
       if (!silent) onDone && onDone(this.text, this.err, this.heard);
     };
     this._done = done;
-    r.onresult = ev => { let interim = "";
+    r.onstart = () => { got.start = true; this.note(`#${n} onstart`); };
+    r.onaudiostart = () => { got.audio = true; this.note(`#${n} audiostart`); };
+    r.onspeechstart = () => { got.speech = true; this.heard = true; onSpeech && onSpeech(); };
+    r.onresult = ev => { if (this.r !== r) return; let interim = "";
       for (let i=ev.resultIndex;i<ev.results.length;i++){ const res = ev.results[i]; if (res.isFinal) this.final += res[0].transcript.trim()+" "; else interim += res[0].transcript; }
+      if (!got.result) this.note(`#${n} first result`); got.result = true;
       this.interim = interim; this.heard = true; onText && onText(this.text); };
-    r.onspeechstart = () => { this.heard = true; onSpeech && onSpeech(); };
-    r.onerror = e => { this.err = (e && e.error) || "error"; };
-    r.onend = done;
-    try { r.start(); } catch(e){ this.err = "start"; done(); return false; }
+    r.onerror = e => { this.err = (e && e.error) || "error"; this.note(`#${n} error ${this.err}`); };
+    r.onend = () => {
+      this.note(`#${n} onend`);
+      // Long answers: iOS ends the session after a silence; restart gently until the user stops.
+      if (continuous && this.r === r && !this._stopping && !this._silent && restarts < 40 && this.err !== "not-allowed" && this.err !== "service-not-allowed"){
+        if (this.interim){ this.final += this.interim+" "; this.interim = ""; }
+        restarts++; const gap = Math.max(250, 900 - (Date.now()-lastStart));
+        setTimeout(() => { if (this.r !== r || this._stopping) return done(); try { lastStart = Date.now(); this.err = ""; r.start(); this.note(`#${n} restart ${restarts}`); } catch(e){ this.note(`#${n} restart failed`); done(); } }, gap);
+        return;
+      }
+      if (this.interim){ this.final += this.interim+" "; this.interim = ""; }
+      done();
+    };
+    try { r.start(); } catch(e){ this.err = "start"; this.note(`#${n} start() threw: ${e.message}`); this.inst = null; done(); return false; }
     this.cap = setTimeout(() => this.stop(), maxSecs*1000);
     return true;
   },
-  stop(){ const r = this.r; if (!r) { if (this.busy && !this._done) this.busy = false; return; }
-    try { r.stop(); } catch(e){}
+  stop(){ const r = this.r; if (!r){ if (this.busy && !this._done) this.busy = false; return; }
+    this._stopping = true; try { r.stop(); } catch(e){}
     clearTimeout(this.force); this.force = setTimeout(() => { try { r.abort(); } catch(e){} this._done && this._done(); }, 1500); },
-  abort(){ this._silent = true; if (!this.r){ this.busy = false; return; } const r = this.r; try { r.abort(); } catch(e){}
-    clearTimeout(this.force); this.force = setTimeout(() => this._done && this._done(), 800); }
+  abort(){ this._silent = true; this._stopping = true; if (!this.r){ this.busy = false; return; } const r = this.r; try { r.abort(); } catch(e){}
+    clearTimeout(this.force); this.force = setTimeout(() => this._done && this._done(), 800); },
+  report(){
+    return [`Parlons ${APP_VERSION}`, navigator.userAgent, `standalone: ${!!navigator.standalone || matchMedia("(display-mode: standalone)").matches}`,
+      `SpeechRecognition: ${!!SR} · audioSession: ${!!navigator.audioSession} · strategy now: ${this.strategy} · attempts: ${this.n}`,
+      `voices fr: ${TTS.load().length} · recLang: ${S.settings.recLang} · transcript: ${S.settings.transcript!==false}`, "", ...this.log].join("\n");
+  }
 };
 window.Listen = Listen;
 const micErrorText = err => ({
   "not-allowed":"Micro refusé. Sur iPhone : Réglages › Safari › Microphone › Autoriser, puis rouvrez l'app.",
   "service-not-allowed":"La reconnaissance vocale est désactivée. Réglages › Général › Clavier › activez Dictée.",
-  "audio-capture":"Le micro est utilisé par une autre app. Fermez-la et réessayez.",
+  "audio-capture":"Le micro n'a pas pu démarrer. Réessayez, ou utilisez la dictée du clavier.",
   "network":"Pas de connexion pour la reconnaissance vocale. Vérifiez votre réseau.",
-  "no-speech":"Je n'ai rien entendu. Parlez un peu plus fort, juste après le bip."}[err] || "");
+  "no-speech":"Je n'ai rien entendu. Parlez un peu plus fort, juste après avoir appuyé."}[err] || "");
 
 window.Mic = Mic; // handy for debugging from the console
 
-// Reusable recorder widget: big mic toggle, level meter, timer, live transcript, a separate red Stop button, playback.
-function recorder(el, opts={}){
-  if (opts.quick && Listen.available()) return quickRecorder(el, opts);
-  return fullRecorder(el, opts);
+// Keyboard-dictation fallback: Apple's own dictation (🎤 on the keyboard) always works.
+function kbdFallback(el, onText, label="⌨️ Dicter avec le clavier"){
+  const w = document.createElement("div"); w.className = "kbd";
+  w.innerHTML = `<button type="button" class="linkbtn">${label}</button>
+    <div class="row kbdrow" hidden><input type="text" placeholder="Touchez 🎤 sur le clavier et parlez" autocomplete="off"><button class="btn sm">OK</button></div>`;
+  const btn = w.querySelector(".linkbtn"), row = w.querySelector(".kbdrow"), inp = w.querySelector("input"), ok = w.querySelector(".btn");
+  btn.onclick = () => { row.hidden = false; btn.hidden = true; inp.focus(); };
+  const go = () => { const v = inp.value.trim(); if (!v) return inp.focus(); inp.value = ""; onText(v); };
+  ok.onclick = go; inp.onkeydown = e => { if (e.key === "Enter"){ e.preventDefault(); go(); } };
+  el.appendChild(w); return w;
 }
-// One phrase at a time: speech recognition only, stops by itself after a pause.
-function quickRecorder(el, {maxSecs=40, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive, compact=false}={}){
+
+function recorder(el, opts={}){
+  if (Listen.available()) return opts.quick ? quickRecorder(el, opts) : longRecorder(el, opts);
+  return fullRecorder(el, opts);   // no speech recognition on this device: record audio only
+}
+// One phrase at a time: stops by itself after a pause.
+function quickRecorder(el, {maxSecs=40, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive, compact=false, keyboard=true}={}){
   el.innerHTML = `<div class="rec ${compact?"compact":""}">
     <button class="mic" type="button" aria-label="Parler">🎤</button>
     <div class="level wave" aria-hidden="true"><i></i></div>
@@ -278,17 +321,52 @@ function quickRecorder(el, {maxSecs=40, hint="Appuyez sur le micro, puis parlez"
       onText: t => { rx.textContent = t || "…"; onLive && onLive(t); },
       onDone: (text, err, heard) => { idle(); const secs = Math.max(1, Math.round((Date.now()-t0)/1000));
         rh.textContent = "Appuyez sur le micro pour recommencer";
-        if (!text){ const m = micErrorText(err); rx.hidden = compact; rx.textContent = m || "Je n'ai pas compris. Réessayez en parlant près du téléphone.";
-          if (err==="not-allowed"||err==="service-not-allowed"||err==="audio-capture") toast(m, 5000); }
+        if (!text){ const m = micErrorText(err); rx.hidden = compact; rx.textContent = (m || "Je n'ai pas compris.") + " Vous pouvez aussi dicter avec le clavier ci-dessous.";
+          if (err==="not-allowed"||err==="service-not-allowed") toast(m, 5000); }
         onStop && onStop(text, secs, heard); }});
-    if (!ok){ idle(); rh.textContent = "Le micro n'a pas démarré. Réessayez."; return; }
+    if (!ok){ idle(); rh.textContent = "Le micro n'a pas démarré. Réessayez, ou dictez avec le clavier."; return; }
     t0 = Date.now(); lvl.classList.add("live"); rh.textContent = "Je vous écoute… (ça s'arrête tout seul après une pause)";
     onStart && onStart();
   };
+  if (keyboard && !compact) kbdFallback(el.querySelector(".rec"), v => { rx.hidden = false; rx.textContent = v; onLive && onLive(v); onStop && onStop(v, 0, true); });
   onLeave(() => Listen.abort());
   return {stop: () => Listen.stop()};
 }
-// Long answers (TCF speaking tasks): records audio + live transcript, Intersection-style.
+// Long answers (TCF speaking tasks): continuous recognition with a timer and a big Stop button.
+function longRecorder(el, {maxSecs=180, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive}={}){
+  el.innerHTML = `<div class="rec">
+    <button class="mic" type="button" aria-label="Enregistrer">🎤</button>
+    <div class="level wave" aria-hidden="true"><i></i></div>
+    <div class="row" style="justify-content:center;gap:8px"><span class="timer rt">0:00</span><span class="small muted rh">${hint}</span></div>
+    <div class="transcript rx" hidden></div>
+    <button class="btn red rs" type="button" hidden>■ J'ai terminé</button></div>`;
+  const q = s => el.querySelector(s);
+  const mic=q(".mic"), lvl=q(".level"), rt=q(".rt"), rh=q(".rh"), rx=q(".rx"), rs=q(".rs");
+  let t0 = 0, tick = null, finished = false;
+  const idle = () => { clearInterval(tick); mic.classList.remove("on"); mic.textContent="🎤"; rs.hidden = true; lvl.classList.remove("live","speech"); };
+  const stopNow = () => { if (Listen.r) Listen.stop(); };
+  mic.onclick = async () => {
+    if (Listen.r) return stopNow();
+    if (Listen.busy) return;
+    finished = false; rx.hidden = false; rx.textContent = "…"; rh.textContent = "Un instant…"; mic.classList.add("on"); mic.textContent = "■";
+    const ok = await Listen.start({maxSecs, continuous:true,
+      onSpeech: () => lvl.classList.add("speech"),
+      onText: t => { rx.textContent = t || "…"; onLive && onLive(t); },
+      onDone: (text, err) => { idle(); if (finished) return; finished = true;
+        const secs = Math.max(1, Math.round((Date.now()-t0)/1000)); rh.textContent = "Appuyez sur le micro pour recommencer";
+        if (!text){ const m = micErrorText(err); rx.textContent = (m || "La transcription n'a rien capté.") + " Dictez votre réponse avec le clavier dans la case ci-dessous."; }
+        onStop && onStop(text, secs); }});
+    if (!ok){ idle(); rh.textContent = "Le micro n'a pas démarré. Réessayez, ou dictez avec le clavier."; return; }
+    t0 = Date.now(); rs.hidden = false; lvl.classList.add("live"); rh.textContent = "Parlez… puis appuyez sur « J'ai terminé »";
+    tick = setInterval(() => { rt.textContent = fmt(Math.round((Date.now()-t0)/1000)); }, 250);
+    onStart && onStart();
+  };
+  rs.onclick = stopNow;
+  kbdFallback(el.querySelector(".rec"), v => { if (finished) return; finished = true; onStop && onStop(v, 0); }, "⌨️ Je préfère dicter avec le clavier");
+  onLeave(() => { clearInterval(tick); Listen.abort(); });
+  return {stop: stopNow};
+}
+// Fallback when the device has no speech recognition: record audio (Intersection-style).
 function fullRecorder(el, {autoStop=0, maxSecs=180, hint="Appuyez sur le micro, puis parlez", onStop, onStart, onLive, compact=false}={}){
   el.innerHTML = `<div class="rec ${compact?"compact":""}">
     <button class="mic" type="button" aria-label="Enregistrer">🎤</button>
@@ -908,8 +986,8 @@ VIEWS.speak = (id) => {
   const countdown = (secs, onEnd) => { let left = secs; clearInterval(timer); $("#tm").textContent = fmt(left);
     timer = setInterval(() => { left--; const el=$("#tm"); if(!el) return clearInterval(timer); el.textContent = fmt(Math.max(0,left)); el.classList.toggle("warn", left<=20); if (left<=0){ clearInterval(timer); onEnd(); } }, 1000); };
   const showRec = () => { const pb = $("#prepbox"); if (pb) pb.querySelector("#prep")?.remove(), pb.querySelector("#skip")?.remove(); $("#rc").hidden = false; $("#tm").textContent = fmt(t.seconds); $("#tm").classList.remove("warn"); };
-  recorder($("#rc"), {maxSecs: t.seconds + 5,
-    onStart: () => { const p=$("#pre"); if(p) p.remove(); countdown(t.seconds, () => { if (Mic.on) Mic.finish(); }); },
+  const rec = recorder($("#rc"), {maxSecs: t.seconds + 5,
+    onStart: () => { const p=$("#pre"); if(p) p.remove(); countdown(t.seconds, () => rec.stop()); },
     onStop: (text, secs) => { clearInterval(timer); results(text, secs); }});
   const pb = $("#prep"); if (pb) pb.onclick = () => { pb.remove(); $("#skip").textContent = "J'ai fini, je parle"; countdown(t.prep, () => { showRec(); toast("À vous ! Appuyez sur le micro."); }); };
   const sk = $("#skip"); if (sk) sk.onclick = () => { clearInterval(timer); showRec(); };
@@ -919,11 +997,12 @@ VIEWS.speak = (id) => {
     $("#after").innerHTML = `<div class="card stack" style="margin-top:12px"><h3>Terminé · ${fmt(secs)}</h3>
       <div class="grid2" style="grid-template-columns:repeat(3,1fr)"><div class="stat"><b>${wc}</b><span>mots</span></div><div class="stat"><b>${wpm}</b><span>mots/min</span></div><div class="stat"><b>${fillers}</b><span>hésitations</span></div></div>
       <p class="small muted">Transcription (corrigez-la si besoin, ou dictez avec le micro du clavier) :</p>
-      <textarea id="ft" style="min-height:140px">${esc(text)}</textarea>
+      <textarea id="ft" style="min-height:140px" placeholder="Touchez ici, puis le 🎤 du clavier pour dicter votre réponse">${esc(text)}</textarea>
       <button class="btn ghost" data-go="#/speak/${t.id}">↻ Recommencer</button></div><div id="gp" style="margin-top:12px"></div>`;
     gradingPanel($("#gp"), "speak", t, () => $("#ft").value, score => { S.speaking.push({id:t.id, task:t.task, date:today(), score, words:wc}); if(S.speaking.length>60) S.speaking.shift(); save(); addXP(30); });
     addXP(10); markDaily("speak");
     $("#after").scrollIntoView({behavior:"smooth"});
+    if (!text) setTimeout(() => $("#ft") && $("#ft").focus(), 400);
   };
 };
 
@@ -1262,7 +1341,9 @@ VIEWS.settings = () => {
       <label class="row between"><span>Transcription en direct</span><input type="checkbox" id="trs" ${S.settings.transcript!==false?"checked":""}></label>
       <p class="small muted">Si le micro bloque, désactivez-la : l'app enregistre quand même votre voix pour que vous puissiez vous réécouter.</p>
       <label class="row between"><span>Lire les réponses de l'IA à voix haute</span><input type="checkbox" id="asp" ${S.settings.autoSpeak!==false?"checked":""}></label>
-      <details><summary>Tester le micro</summary><p class="small muted">Dites une phrase. La barre bouge si le micro vous entend.</p><div id="mt"></div></details>
+      <details><summary>Tester le micro</summary><p class="small muted">Dites une phrase, puis recommencez 2 ou 3 fois de suite.</p><div id="mt"></div></details>
+      <details><summary>Rapport de diagnostic</summary><p class="small muted">Si le micro ne marche pas, faites quelques essais, puis copiez ce rapport et envoyez-le à Claude.</p>
+        <pre class="diag" id="diag"></pre><button class="btn sm soft" id="dcopy">Copier le rapport</button></details>
     </div>
     <div class="card stack" style="margin-top:12px"><h3>Voix</h3>
       ${vs.length?`<select id="vc">${vs.map(v=>`<option value="${esc(v.name)}" ${v.name===S.settings.voice?"selected":""}>${esc(v.name)} (${v.lang})</option>`).join("")}</select>`:`<p class="small muted">Aucune voix française détectée. Sur iPhone : Réglages › Accessibilité › Contenu énoncé › Voix › Français, et téléchargez une voix « améliorée ».</p>`}
@@ -1293,8 +1374,12 @@ VIEWS.settings = () => {
   $("#rt").oninput = e => { S.settings.rate=+e.target.value; $("#rv").textContent=S.settings.rate; save(); };
   $$("#th button").forEach(b=>b.onclick=()=>{ S.settings.theme=b.dataset.v; save(); applyTheme(); $$("#th button").forEach(x=>x.classList.toggle("on",x===b)); });
   $("#trs").onchange = e => { S.settings.transcript = e.target.checked; save(); };
+  const showDiag = () => { $("#diag").textContent = Listen.report(); };
+  $("#diag").closest("details").addEventListener("toggle", showDiag);
+  $("#dcopy").onclick = async () => { showDiag(); try { await navigator.clipboard.writeText(Listen.report()); toast("Rapport copié. Collez-le dans votre conversation avec Claude."); }
+    catch(e){ const r = document.createRange(); r.selectNodeContents($("#diag")); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); toast("Sélectionné : touchez Copier."); } };
   $("#asp").onchange = e => { S.settings.autoSpeak = e.target.checked; save(); };
-  recorder($("#mt"), {quick:true, autoStop:2000, maxSecs:15, onStop:(t, secs, heard) => toast(t ? "✓ Le micro fonctionne." : heard ? "Le micro vous entend, mais la transcription ne marche pas. Désactivez-la ci-dessus." : "Aucun son capté. Autorisez le micro pour Safari.", 4000)});
+  let mtN = 0; recorder($("#mt"), {quick:true, keyboard:false, maxSecs:15, onStop:(t) => { mtN++; toast(t ? `✓ Essai ${mtN} : « ${t.slice(0,40)} »` : `✗ Essai ${mtN} : rien capté. Ouvrez le rapport de diagnostic ci-dessous.`, 4000); }});
   $$("#rl button").forEach(b=>b.onclick=()=>{ S.settings.recLang=b.dataset.v; save(); $$("#rl button").forEach(x=>x.classList.toggle("on",x===b)); });
   $$("#fl button").forEach(b=>b.onclick=()=>{ S.settings.fbLang=b.dataset.v; save(); $$("#fl button").forEach(x=>x.classList.toggle("on",x===b)); });
   $("#ak").onchange = e => { S.settings.apiKey=e.target.value.trim(); save(); toast(S.settings.apiKey?"Clé enregistrée":"Clé supprimée"); };
