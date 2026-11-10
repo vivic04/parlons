@@ -1,7 +1,7 @@
 // Network-first for the app's own files (so updates show up immediately), cache fallback when offline.
-const CACHE = "parlons-v7";
-const CORE = ["./", "index.html", "styles.css?v=7", "app.js?v=7", "city.js?v=7", "data/vocab.js?v=7", "data/grammar.js?v=7",
-  "data/comprehension.js?v=7", "data/production.js?v=7", "data/vocab2.js?v=7", "data/grammar2.js?v=7", "data/oral2.js?v=7", "data/ecrit2.js?v=7", "data/production2.js?v=7", "data/conversations.js?v=7", "data/audiokey.js?v=7", "audio/manifest.js?v=7", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
+const CACHE = "parlons-v8";
+const CORE = ["./", "index.html", "styles.css?v=8", "app.js?v=8", "city.js?v=8", "data/vocab.js?v=8", "data/grammar.js?v=8",
+  "data/comprehension.js?v=8", "data/production.js?v=8", "data/vocab2.js?v=8", "data/grammar2.js?v=8", "data/oral2.js?v=8", "data/ecrit2.js?v=8", "data/production2.js?v=8", "data/conversations.js?v=8", "data/audiokey.js?v=8", "audio/manifest.js?v=8", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));
