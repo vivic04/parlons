@@ -1,7 +1,7 @@
 // Network-first for the app's own files (so updates show up immediately), cache fallback when offline.
-const CACHE = "parlons-v6";
-const CORE = ["./", "index.html", "styles.css?v=6", "app.js?v=6", "city.js?v=6", "data/vocab.js?v=6", "data/grammar.js?v=6",
-  "data/comprehension.js?v=6", "data/production.js?v=6", "data/vocab2.js?v=6", "data/grammar2.js?v=6", "data/oral2.js?v=6", "data/ecrit2.js?v=6", "data/production2.js?v=6", "data/conversations.js?v=6", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
+const CACHE = "parlons-v7";
+const CORE = ["./", "index.html", "styles.css?v=7", "app.js?v=7", "city.js?v=7", "data/vocab.js?v=7", "data/grammar.js?v=7",
+  "data/comprehension.js?v=7", "data/production.js?v=7", "data/vocab2.js?v=7", "data/grammar2.js?v=7", "data/oral2.js?v=7", "data/ecrit2.js?v=7", "data/production2.js?v=7", "data/conversations.js?v=7", "data/audiokey.js?v=7", "audio/manifest.js?v=7", "manifest.webmanifest", "icons/icon-192.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting()));
@@ -18,6 +18,7 @@ self.addEventListener("fetch", e => {
   const isFont = /fonts\.(googleapis|gstatic)\.com$/.test(url.hostname);
   if (!sameOrigin && !isFont) return;
   if (sameOrigin && url.pathname.endsWith("version.json")) return;
+  if (sameOrigin && url.pathname.includes("/audio/")) return;   // let Safari stream audio itself (range requests)
   e.respondWith(
     fetch(req, sameOrigin ? {cache:"no-store"} : undefined).then(res => {
       if (res.ok || res.type === "opaque") { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }

@@ -1,7 +1,7 @@
 /* Parlons — TCF French trainer (A1 → B2). No build step, no backend. */
 (() => {
 "use strict";
-const APP_VERSION = "2.3";
+const APP_VERSION = "2.4";
 const LEVELS = ["A1","A2","B1","B2"];
 const LKEY = "parlons-v1";
 const $ = (s, r=document) => r.querySelector(s);
@@ -62,8 +62,35 @@ const TTS = {
     const sorted = vs.slice().sort((a,b)=>rank(b)-rank(a)); const pref = sorted[0];
     if (i===0) return pref;
     return sorted.find(v=>v!==pref && v.lang===pref.lang) || sorted.find(v=>v!==pref) || pref; },
-  stop(){ this.gen++; this.speaking=false; this.utts=[]; clearInterval(this.dog); try { speechSynthesis.cancel(); } catch(e){} $$(".playing").forEach(b=>b.classList.remove("playing")); },
+  stop(){ this.gen++; this.speaking=false; this.utts=[]; clearInterval(this.dog);
+    if (Clip.el){ Clip.el.onended = Clip.el.onerror = null; try { Clip.el.pause(); } catch(e){} }
+    try { speechSynthesis.cancel(); } catch(e){} $$(".playing").forEach(b=>b.classList.remove("playing")); },
+  // Recorded clip when we have one (reliable on iPhone, plays in Silent mode); the phone's voice only for text
+  // created on the spot (AI replies, AI-generated documents).
   speak(text, opts={}){
+    const key = window.audioKey ? audioKey(text) : "";
+    if (window.AUDIO && AUDIO.has(key)) return this.playClip(key, text, opts);
+    return this.speakSynth(text, opts);
+  },
+  playClip(key, text, opts={}){
+    if (typeof Listen !== "undefined" && Listen.busy) Listen.abort();
+    if (Mic.on) Mic.stop();
+    this.stop(); setAudioSession("playback");
+    const gen = this.gen, a = Clip.ensure(), rate = (opts.rate ?? S.settings.rate) / 0.95;
+    this.speaking = true; opts.btn && opts.btn.classList.add("playing");
+    const finish = () => { if (gen !== this.gen) return; this.speaking = false; a.onended = a.onerror = null; opts.btn && opts.btn.classList.remove("playing"); opts.onend && opts.onend(); };
+    const fallback = () => { if (gen !== this.gen) return; a.onended = a.onerror = null; this.speakSynth(text, opts); };
+    a.onended = finish; a.onerror = fallback;
+    a.src = "audio/" + key + ".mp3";
+    try { a.preservesPitch = true; a.webkitPreservesPitch = true; } catch(e){}
+    a.defaultPlaybackRate = rate; a.playbackRate = rate;
+    a.onplaying = () => { if (Math.abs(a.playbackRate - rate) > .01) a.playbackRate = rate; };
+    const p = a.play();
+    if (p && p.catch) p.catch(err => { if (gen !== this.gen) return;
+      if (err && err.name === "NotAllowedError"){ this.speaking = false; opts.btn && opts.btn.classList.remove("playing"); opts.onblocked ? opts.onblocked() : (opts.auto ? null : toast("Touchez 🔊 pour écouter.")); }
+      else fallback(); });
+  },
+  speakSynth(text, opts={}){
     if (!("speechSynthesis" in window)) { toast("La synthèse vocale n'est pas disponible sur cet appareil."); opts.onend && opts.onend(); return; }
     if (typeof Listen !== "undefined" && Listen.busy) Listen.abort();
     if (Mic.on) Mic.stop();
@@ -108,9 +135,15 @@ const TTS = {
   }
 };
 if ("speechSynthesis" in window){ TTS.load(); speechSynthesis.onvoiceschanged = () => TTS.load(); }
+// One shared audio element for recorded clips (iOS only lets an element play without a tap once it has been unlocked by one).
+const Clip = { el:null, unlocked:false,
+  ensure(){ if (!this.el){ const a = new Audio(); a.preload = "auto"; a.setAttribute("playsinline", ""); a.setAttribute("webkit-playsinline", ""); this.el = a; } return this.el; },
+  unlock(){ if (this.unlocked) return; this.unlocked = true; const a = this.ensure(); if (a.src && !a.paused) return;
+    try { a.src = "data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA=="; a.volume = 1; const p = a.play(); p && p.catch && p.catch(() => { this.unlocked = false; }); } catch(e){ this.unlocked = false; } } };
+window.Clip = Clip; window.TTS = TTS;
 // iOS only lets speech start from a tap. Prime it on the first tap so replies fetched later (AI conversation) can be spoken.
 (function unlockSpeech(){
-  const go = () => { try { if (!speechSynthesis.speaking){ const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } } catch(e){}
+  const go = () => { Clip.unlock();
     document.removeEventListener("touchend", go, true); document.removeEventListener("click", go, true); };
   document.addEventListener("touchend", go, true); document.addEventListener("click", go, true);
 })();
@@ -711,7 +744,7 @@ VIEWS.vocab = () => {
           <p class="fr" style="font-size:16px">${esc(w[4])} ${speakBtn(w[4])}</p></div>
           ${mode==="recog"?`<button class="btn ghost" id="show" style="margin-top:12px">Afficher la réponse</button>`:""}
         </div></div><div id="gb" style="display:${mode==="learn"?"block":"none"}">${mode==="learn"?`<button class="btn" data-q="1" style="margin-top:12px">Je l'ai noté →</button>`:buttons}</div>`;
-        setTimeout(()=>TTS.speak(w[0]),150);
+        setTimeout(()=>TTS.speak(w[0], {auto:true}),150);
         const sh = $("#show"); if (sh) sh.onclick = () => { $("#rev").style.display="block"; sh.remove(); $("#gb").style.display="block"; };
         $$("#gb [data-q]").forEach(b=>b.onclick=()=>finish(+b.dataset.q));
       } else {
@@ -721,7 +754,7 @@ VIEWS.vocab = () => {
           <input type="text" id="ans" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Votre réponse">
           <div id="acc"></div><button class="btn" id="chk">Vérifier</button><div id="res"></div></div>`;
         $("#acc").appendChild(accentBar($("#ans")));
-        if (mode==="listen") setTimeout(()=>TTS.speak(w[0]),200); else $("#ans").focus();
+        if (mode==="listen") setTimeout(()=>TTS.speak(w[0], {auto:true}),200); else $("#ans").focus();
         const check = () => {
           const v = $("#ans").value.trim(); if (!v) return;
           const target = w[0].replace(/\s*\(.*\)/,"");
@@ -792,7 +825,7 @@ function quiz(el, items, onDone, {shuffleOpts=true, audio=false}={}){
     $$(".opt",el).forEach(b=>b.onclick=()=>{
       const k=+b.dataset.k, ok = k===it.ans; if(ok) right++;
       $$(".opt",el).forEach((x,j)=>{ x.disabled=true; if(j===it.ans) x.classList.add("correct"); else if(j===k) x.classList.add("wrong"); });
-      const full = it.q.replace("___", it.opts[it.ans]);
+      const full = fillBlank(it.q, it.opts[it.ans]);
       $("#fb",el).innerHTML = `<div class="feedback ${ok?"ok":"ko"}">${ok?"✓ Correct.":"✗ La bonne réponse : <b>"+esc(it.opts[it.ans])+"</b>."} ${esc(it.why||"")}</div>
         <div class="row" style="margin-top:10px">${it.q.includes("___")?speakBtn(full):""}<button class="btn" id="nx">Suivant →</button></div>`;
       $("#nx",el).onclick = () => { i++; show(); };
@@ -881,7 +914,7 @@ VIEWS.dictee = () => {
       <textarea id="dt" style="min-height:110px" autocapitalize="sentences" placeholder="Écrivez ici…"></textarea><div id="acc"></div>
       <button class="btn" id="chk">Vérifier</button><div id="res"></div></div>`;
     $("#acc").appendChild(accentBar($("#dt")));
-    setTimeout(()=>TTS.speak(s.fr),200);
+    setTimeout(()=>TTS.speak(s.fr, {auto:true}),200);
     $("#chk").onclick = () => {
       const v = $("#dt").value; if(!v.trim()) return;
       const r = compare(s.fr, v, {accents:true});
@@ -1161,6 +1194,7 @@ Réponds UNIQUEMENT avec un objet JSON valide, sans aucun texte autour, au forma
   const pauseCall = () => { call.on = false; Listen.abort(); TTS.stop(); status("idle"); };
   orb.onclick = () => {
     if (!call.on){ call.on = true; call.misses = 0;
+      try { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); } catch(e){}
       if (!call.started){ call.started = true; status("speaking"); TTS.speak(c.opener, {onend: () => { if (call.on) setTimeout(listenTurn, 350); }}); }
       else listenTurn();
       return; }
@@ -1349,7 +1383,7 @@ VIEWS.settings = () => {
       ${vs.length?`<select id="vc">${vs.map(v=>`<option value="${esc(v.name)}" ${v.name===S.settings.voice?"selected":""}>${esc(v.name)} (${v.lang})</option>`).join("")}</select>`:`<p class="small muted">Aucune voix française détectée. Sur iPhone : Réglages › Accessibilité › Contenu énoncé › Voix › Français, et téléchargez une voix « améliorée ».</p>`}
       <label class="small muted">Vitesse : <span id="rv">${S.settings.rate}</span></label><input type="range" id="rt" min="0.6" max="1.2" step="0.05" value="${S.settings.rate}" style="width:100%">
       <button class="btn soft" data-say="Bonjour ! Je suis votre professeur de français. On commence ?">🔊 Tester la voix</button>
-      <p class="small muted">Pas de son sur iPhone ? Désactivez le mode silencieux (interrupteur sur le côté).</p>
+      <p class="small muted">Les mots, phrases et documents sont enregistrés : ils marchent même en mode silencieux. Seules les réponses de l'IA utilisent la voix de l'iPhone.</p>
       <label class="small muted">Accent pour la reconnaissance vocale</label>
       <div class="seg" id="rl"><button data-v="fr-FR" class="${S.settings.recLang==="fr-FR"?"on":""}">France</button><button data-v="fr-CA" class="${S.settings.recLang==="fr-CA"?"on":""}">Canada</button></div>
     </div>
